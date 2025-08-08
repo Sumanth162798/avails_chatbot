@@ -5,7 +5,7 @@ import os
 import json
 
 # ---------- Load OpenAI Key from Streamlit Secrets ----------
-openai.api_key = st.secrets["OPENAI_API_KEY"]
+client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # ---------- Region Detection ----------
 def detect_region(prompt):
@@ -57,8 +57,9 @@ Given a user query, return a JSON object with filters like:
 Valid keys: country, final_format, os, publisher_type, is_premium_inventory,
 allows_crypto_ads, allows_gambling_ads, allows_cannabis_ads, content_rating, cas_min.
 ALWAYS return a valid JSON object. Never include explanation or code block formatting."""
+
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_message},
@@ -66,8 +67,10 @@ ALWAYS return a valid JSON object. Never include explanation or code block forma
             ],
             temperature=0.2
         )
+
         content = response.choices[0].message.content.strip()
         return json.loads(content)
+
     except Exception as e:
         st.error(f"OpenAI Error: {e}")
         return {}
