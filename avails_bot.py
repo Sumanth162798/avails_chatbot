@@ -1,3 +1,4 @@
+# avails_bot.py
 import os, json, re, unicodedata, difflib
 from typing import List, Optional, Any, Dict, Set
 
@@ -51,6 +52,7 @@ COLUMN_ALIASES = {
 
     # App / publisher
     "app name": "Inmobi App Name",
+    "inmobi app name": "Inmobi App Name",
     "bundle": "Forwarded Bundle ID",
     "bundle id": "Forwarded Bundle ID",
     "package": "Forwarded Bundle ID",
@@ -151,8 +153,8 @@ CATEGORY_SYNONYMS = {
     "art": "Arts & Design",
     "weather": "Weather",
     "maps": "Maps & Navigation",
-    "food & drink": "Food & Drink",
     "beauty & fitness": "Beauty & Fitness",
+    "food & drink": "Food & Drink",
 }
 
 # =========================
@@ -193,6 +195,24 @@ def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
     df["Final Format"] = df.apply(derive_final_format, axis=1)
     return df
 
+def derive_vertical(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Vertical is Gaming/Non Gaming based on categories:
+    - If Primary Category has 'game/games/gaming' -> Gaming
+    - Else Non Gaming
+    - If Primary not present, fall back to Inmobi App Categories
+    """
+    if "Primary Category" in df.columns:
+        mask = df["Primary Category"].astype(str).str.contains(r"\bgam(e|es|ing)\b", case=False, na=False)
+    elif "Inmobi App Categories" in df.columns:
+        mask = df["Inmobi App Categories"].astype(str).str.contains(r"\bgam(e|es|ing)\b", case=False, na=False)
+    else:
+        df["Vertical"] = "Non Gaming"
+        return df
+
+    df["Vertical"] = mask.map({True: "Gaming", False: "Non Gaming"})
+    return df
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
     cols_lower = {c.lower(): c for c in df.columns}
@@ -222,6 +242,7 @@ def load_df(region: str) -> pd.DataFrame:
     if "Inmobi App Name" in df.columns:
         df["Inmobi App Name"] = df["Inmobi App Name"].apply(clean_app_name)
     df = apply_final_format(df)
+    df = derive_vertical(df)      # <- derive Gaming / Non Gaming
     df = coerce_types(df)
     return df
 
@@ -233,13 +254,11 @@ def build_category_vocab(df: pd.DataFrame) -> List[str]:
     if "Primary Category" in df.columns:
         vocab.update([str(x).strip() for x in df["Primary Category"].dropna().unique()])
     if "Inmobi App Categories" in df.columns:
-        # split by common delimiters
         for s in df["Inmobi App Categories"].dropna().astype(str):
             for piece in re.split(r"[;,|/]", s):
                 piece = piece.strip()
                 if piece:
                     vocab.add(piece)
-    # Clean empties
     vocab = {v for v in vocab if v and v.lower() != "nan"}
     return sorted(vocab)
 
@@ -247,40 +266,39 @@ def map_categories_with_llm(raw_terms: List[str], vocab: List[str]) -> List[str]
     if not raw_terms:
         return []
     try:
-        prompt = {
-            "instruction": "Map user terms to the closest items in the provided CATEGORY_VOCAB. Return JSON array of exact vocab strings.",
+        payload = {
+            "instruction": "Map user terms to the closest items in CATEGORY_VOCAB. Return JSON array of exact vocab strings.",
             "user_terms": raw_terms,
             "CATEGORY_VOCAB": vocab[:400]  # trim if huge
         }
         resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role":"system","content":"Return only JSON array, no prose."},
-                {"role":"user","content":json.dumps(prompt)}
+                {"role":"system","content":"Return only a JSON array or an object with key 'mapped'."},
+                {"role":"user","content":json.dumps(payload)}
             ],
             temperature=0.0,
             response_format={"type":"json_object"},
         )
         obj = json.loads(resp.choices[0].message.content.strip())
-        out = obj if isinstance(obj, list) else obj.get("mapped", [])
+        if isinstance(obj, list):
+            out = obj
+        else:
+            out = obj.get("mapped", [])
         return [x for x in out if x in vocab]
     except Exception:
-        # fallback handled by fuzzy
         return []
 
 def fuzzy_map_categories(raw_terms: List[str], vocab: List[str]) -> List[str]:
     mapped: List[str] = []
     for t in raw_terms:
         t_norm = t.strip().lower()
-        # synonym first
         t_syn = CATEGORY_SYNONYMS.get(t_norm)
         if t_syn and t_syn in vocab:
             mapped.append(t_syn); continue
-        # fuzzy
         best = difflib.get_close_matches(t, vocab, n=1, cutoff=0.6)
         if best:
             mapped.append(best[0])
-    # de-dup preserve order
     seen = set(); out = []
     for x in mapped:
         if x not in seen:
@@ -291,11 +309,9 @@ def resolve_categories(raw_terms: List[str], df: pd.DataFrame) -> List[str]:
     vocab = build_category_vocab(df)
     if not raw_terms: 
         return []
-    # try LLM first
     llm = map_categories_with_llm(raw_terms, vocab)
     if llm:
         return llm
-    # fallback to fuzzy+synonyms
     return fuzzy_map_categories(raw_terms, vocab)
 
 # =========================
@@ -312,6 +328,7 @@ Guidance:
 - "USA"/"US" => "United States" for column "Country Name".
 - "SDK integration" => {"column":"Integration Method","op":"equals","value":"SDK"}.
 - "rewarded video" => final_format "Rewarded Video" and/or {"column":"Is Rewarded Slot","op":"is_true"}.
+- If user says "gaming" or "non gaming", add a filter on column "Vertical" equals "Gaming"/"Non Gaming".
 - If user says "premium"/"safe", add macro "premium".
 - If user says "green media", add macro "green".
 - "local apps" => macro "local_apps".
@@ -348,11 +365,16 @@ def extract_query(prompt: str) -> Dict[str, Any]:
         if "interstitial" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
         if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
         if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
+        # gaming / non-gaming
+        if "non gaming" in p or "non-gaming" in p:
+            out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
+        elif "gaming" in p:
+            out["filters"].append({"column":"Vertical","op":"equals","value":"Gaming"})
         # macros
         if "premium" in p or "safe" in p: out["macros"].append("premium")
         if "green" in p: out["macros"].append("green")
         if "local" in p: out["macros"].append("local_apps")
-        # categories (very rough)
+        # categories (rough)
         for k in ["cars","auto","beauty","finance","fintech","food","travel","education","health","fitness","parenting","sports","news","shopping","entertainment","music","video","business","lifestyle"]:
             if k in p: out["categories_raw"].append(k)
         return out
@@ -460,7 +482,7 @@ def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
 st.set_page_config(page_title="Avails Bot — Smart Filters", layout="wide")
 st.title("Avails Bot — App‑level List (Smart, Schema‑Aware)")
 
-user_input = st.text_input("Ask anything (e.g., 'Premium cars apps in US on SDK, Android')")
+user_input = st.text_input("Ask anything (e.g., 'Premium rewarded video gaming apps in United States on SDK, Android')")
 
 if user_input:
     region = detect_region(user_input)
@@ -469,11 +491,15 @@ if user_input:
 
     q = extract_query(user_input)
 
-    # Show model understanding
     with st.expander("Parsed query (debug)"):
         st.json(q)
 
     d = df.copy()
+
+    # Apply Vertical first if present (Gaming / Non Gaming)
+    for filt in q.get("filters", []):
+        if (filt.get("column") or "").strip().lower() == "vertical" and "Vertical" in d.columns:
+            d = apply_one_filter(d, "Vertical", filt.get("op","equals"), filt.get("value"))
 
     # final_format if present
     ff = q.get("final_format")
@@ -487,6 +513,9 @@ if user_input:
         val = filt.get("value")
         if col and alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
             val = normalize_country(val)
+        # skip if we already applied Vertical above (it will be idempotent but avoid rework)
+        if (col or "").strip().lower() == "vertical":
+            continue
         d = apply_one_filter(d, col or "", op or "equals", val)
 
     # categories: map user terms → dataset categories (Primary first, fallback to Inmobi App Categories)
@@ -496,7 +525,6 @@ if user_input:
         if "Primary Category" in d.columns:
             mask = d["Primary Category"].astype(str).isin(mapped_cats)
             if not mask.any() and "Inmobi App Categories" in d.columns:
-                # fallback: contains in multi-category field
                 patt = "|".join(map(re.escape, mapped_cats))
                 mask = d["Inmobi App Categories"].astype(str).str.contains(patt, case=False, na=False)
             d = d[mask]
