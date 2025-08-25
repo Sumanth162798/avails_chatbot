@@ -1,5 +1,5 @@
 # avails_bot.py
-import os, json, re, unicodedata, difflib
+import os, json, re, unicodedata, difflib, traceback
 from typing import List, Optional, Any, Dict, Set
 
 import pandas as pd
@@ -9,6 +9,15 @@ import openai
 # =========================
 # Config / Constants
 # =========================
+# Toggle heuristic-only mode if LLM is flaky
+USE_LLM = True  # set False to force heuristic parser for every prompt
+
+# Show a tiny banner so you know which mode you're in
+st.set_page_config(page_title="Avails Bot — Smart Filters", layout="wide")
+mode_badge = "LLM mode" if USE_LLM else "Heuristic mode"
+st.caption(f"🔧 Parser mode: **{mode_badge}**")
+
+# OpenAI client (expects OPENAI_API_KEY in Streamlit secrets)
 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 NUMERIC_HINTS = {
@@ -18,7 +27,6 @@ NUMERIC_HINTS = {
     "Ad Impressions Rendered",
     "Total Burn",
     "eCPM",  # ignored during group; recomputed later
-    "CAS Forwards",
 }
 
 BOOL_LIKE_HINTS = {
@@ -112,12 +120,12 @@ APP_GROUP_KEYS = [
     "Publisher Account Type",
     "Inmobi App Inc ID",
     "Inmobi App Name",
-    "Forwarded Bundle ID",     # ensure bundle is grouped
-    "Operating System Name",   # ensure OS is grouped
+    "Forwarded Bundle ID",     # always included
+    "Operating System Name",   # always included
     "URL",
 ]
 
-# Display order (bundle + OS included)
+# Display order (bundle + OS + Valid Ad Request included)
 DISPLAY_COLS_ORDER = [
     "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
     "Inmobi App Inc ID","Inmobi App Name",
@@ -127,38 +135,20 @@ DISPLAY_COLS_ORDER = [
     "Valid Ad Request","Ad Impressions Rendered","Total Burn","eCPM",
 ]
 
-# lightweight synonyms for categories for fallback
+# lightweight synonyms for categories (fallback)
 CATEGORY_SYNONYMS = {
-    "cars": "Automotive",
-    "auto": "Automotive",
-    "automobile": "Automotive",
-    "beauty": "Beauty & Fitness",
-    "makeup": "Beauty & Fitness",
-    "finance": "Finance",
-    "fintech": "Finance",
-    "food": "Food & Drink",
-    "restaurants": "Food & Drink",
-    "travel": "Travel",
-    "education": "Education",
-    "health": "Health & Fitness",
-    "fitness": "Health & Fitness",
-    "parenting": "Parenting",
-    "kids": "Parenting",
-    "sports": "Sports",
-    "news": "News",
-    "shopping": "Shopping",
-    "ecommerce": "Shopping",
-    "entertainment": "Entertainment",
-    "music": "Music",
-    "video": "Video",
-    "productivity": "Productivity",
-    "business": "Business",
-    "lifestyle": "Lifestyle",
-    "photography": "Photography",
-    "art": "Arts & Design",
-    "weather": "Weather",
-    "maps": "Maps & Navigation",
-    "beauty & fitness": "Beauty & Fitness",
+    "cars": "Automotive","auto": "Automotive","automobile": "Automotive",
+    "beauty": "Beauty & Fitness","makeup": "Beauty & Fitness",
+    "finance": "Finance","fintech": "Finance",
+    "food": "Food & Drink","restaurants": "Food & Drink",
+    "travel": "Travel","education": "Education",
+    "health": "Health & Fitness","fitness": "Health & Fitness",
+    "parenting": "Parenting","kids": "Parenting",
+    "sports": "Sports","news": "News","shopping": "Shopping","ecommerce": "Shopping",
+    "entertainment": "Entertainment","music": "Music","video": "Video",
+    "productivity": "Productivity","business": "Business","lifestyle": "Lifestyle",
+    "photography": "Photography","art": "Arts & Design","weather": "Weather",
+    "maps": "Maps & Navigation","beauty & fitness": "Beauty & Fitness",
     "food & drink": "Food & Drink",
 }
 
@@ -192,21 +182,17 @@ def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
             return "Banner"
         elif placement == "interstitial":
             return "Rewarded Video" if rewarded else "FSI"
+        elif placement == "video":
+            # treat rewarded video even if Placement Type is 'Video'
+            return "Rewarded Video" if rewarded else "API Video"
         elif placement == "native":
             return "Native"
-        elif placement == "video":
-            return "API Video"
         return "Unknown"
     df["Final Format"] = df.apply(derive_final_format, axis=1)
     return df
 
 def derive_vertical(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Vertical is Gaming/Non Gaming based on categories:
-    - If Primary Category has 'game/games/gaming' -> Gaming
-    - Else Non Gaming
-    - If Primary not present, fall back to Inmobi App Categories
-    """
+    """Gaming if Primary Category (or Inmobi App Categories) contains game/games/gaming."""
     if "Primary Category" in df.columns:
         mask = df["Primary Category"].astype(str).str.contains(r"\bgam(e|es|ing)\b", case=False, na=False)
     elif "Inmobi App Categories" in df.columns:
@@ -246,7 +232,7 @@ def load_df(region: str) -> pd.DataFrame:
     if "Inmobi App Name" in df.columns:
         df["Inmobi App Name"] = df["Inmobi App Name"].apply(clean_app_name)
     df = apply_final_format(df)
-    df = derive_vertical(df)      # <- derive Gaming / Non Gaming
+    df = derive_vertical(df)
     df = coerce_types(df)
     return df
 
@@ -267,13 +253,12 @@ def build_category_vocab(df: pd.DataFrame) -> List[str]:
     return sorted(vocab)
 
 def map_categories_with_llm(raw_terms: List[str], vocab: List[str]) -> List[str]:
-    if not raw_terms:
-        return []
+    if not raw_terms: return []
     try:
         payload = {
             "instruction": "Map user terms to the closest items in CATEGORY_VOCAB. Return JSON array of exact vocab strings.",
             "user_terms": raw_terms,
-            "CATEGORY_VOCAB": vocab[:400]  # trim if huge
+            "CATEGORY_VOCAB": vocab[:400]
         }
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -284,11 +269,9 @@ def map_categories_with_llm(raw_terms: List[str], vocab: List[str]) -> List[str]
             temperature=0.0,
             response_format={"type":"json_object"},
         )
-        obj = json.loads(resp.choices[0].message.content.strip())
-        if isinstance(obj, list):
-            out = obj
-        else:
-            out = obj.get("mapped", [])
+        raw = (resp.choices[0].message.content or "").strip()
+        obj = json.loads(raw)
+        out = obj if isinstance(obj, list) else obj.get("mapped", [])
         return [x for x in out if x in vocab]
     except Exception:
         return []
@@ -311,15 +294,13 @@ def fuzzy_map_categories(raw_terms: List[str], vocab: List[str]) -> List[str]:
 
 def resolve_categories(raw_terms: List[str], df: pd.DataFrame) -> List[str]:
     vocab = build_category_vocab(df)
-    if not raw_terms: 
-        return []
+    if not raw_terms: return []
     llm = map_categories_with_llm(raw_terms, vocab)
-    if llm:
-        return llm
+    if llm: return llm
     return fuzzy_map_categories(raw_terms, vocab)
 
 # =========================
-# LLM parsing (JSON-only) + safe fallback
+# LLM parsing with explicit error surfacing
 # =========================
 LLM_SYSTEM = """You are a filter compiler for an avails dataset.
 Return ONLY a JSON object with keys:
@@ -340,7 +321,48 @@ Guidance:
 Return compact JSON. No prose, no code fences.
 """
 
-def extract_query(prompt: str) -> Dict[str, Any]:
+def heuristic_query(prompt: str) -> Dict[str, Any]:
+    p = (prompt or "").lower()
+    out = {"filters": [], "macros": [], "thresholds": {}, "categories_raw": []}
+    # country
+    if any(k in p for k in ["usa","us","united states"]):
+        out["filters"].append({"column":"Country Name","op":"equals","value":"United States"})
+    if "india" in p: out["filters"].append({"column":"Country Name","op":"equals","value":"India"})
+    # os
+    if "android" in p: out["filters"].append({"column":"Operating System Name","op":"equals","value":"Android"})
+    if "ios" in p or "iphone" in p: out["filters"].append({"column":"Operating System Name","op":"equals","value":"iOS"})
+    # integration
+    if "sdk" in p: out["filters"].append({"column":"Integration Method","op":"equals","value":"SDK"})
+    # formats
+    if "rewarded" in p: out["filters"].append({"column":"Is Rewarded Slot","op":"is_true"})
+    if "banner" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Banner"})
+    if "interstitial" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
+    if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
+    if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
+    # gaming / non-gaming
+    if "non gaming" in p or "non-gaming" in p:
+        out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
+    elif "gaming" in p:
+        out["filters"].append({"column":"Vertical","op":"equals","value":"Gaming"})
+    # macros
+    if "premium" in p or "safe" in p: out["macros"].append("premium")
+    if "green" in p: out["macros"].append("green")
+    if "local" in p: out["macros"].append("local_apps")
+    # categories (rough)
+    for k in ["cars","auto","beauty","finance","fintech","food","travel","education","health","fitness","parenting","sports","news","shopping","entertainment","music","video","business","lifestyle"]:
+        if k in p: out["categories_raw"].append(k)
+    return out
+
+def extract_query_with_errors(prompt: str) -> Dict[str, Any]:
+    """
+    Returns:
+      dict with keys: parsed (dict or None), error (str or None), raw (str or None), request_id (str or None)
+    """
+    info = {"parsed": None, "error": None, "raw": None, "request_id": None}
+    if not USE_LLM:
+        info["parsed"] = heuristic_query(prompt)
+        return info
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -349,39 +371,19 @@ def extract_query(prompt: str) -> Dict[str, Any]:
             temperature=0.1,
             response_format={"type": "json_object"},
         )
-        return json.loads(resp.choices[0].message.content.strip())
-    except Exception:
-        # Heuristic fallback so simple prompts still work
-        p = (prompt or "").lower()
-        out = {"filters": [], "macros": [], "thresholds": {}, "categories_raw": []}
-        # country
-        if any(k in p for k in ["usa","us","united states"]):
-            out["filters"].append({"column":"Country Name","op":"equals","value":"United States"})
-        if "india" in p: out["filters"].append({"column":"Country Name","op":"equals","value":"India"})
-        # os
-        if "android" in p: out["filters"].append({"column":"Operating System Name","op":"equals","value":"Android"})
-        if "ios" in p or "iphone" in p: out["filters"].append({"column":"Operating System Name","op":"equals","value":"iOS"})
-        # integration
-        if "sdk" in p: out["filters"].append({"column":"Integration Method","op":"equals","value":"SDK"})
-        # formats
-        if "rewarded" in p: out["filters"].append({"column":"Is Rewarded Slot","op":"is_true"})
-        if "banner" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Banner"})
-        if "interstitial" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
-        if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
-        if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
-        # gaming / non-gaming
-        if "non gaming" in p or "non-gaming" in p:
-            out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
-        elif "gaming" in p:
-            out["filters"].append({"column":"Vertical","op":"equals","value":"Gaming"})
-        # macros
-        if "premium" in p or "safe" in p: out["macros"].append("premium")
-        if "green" in p: out["macros"].append("green")
-        if "local" in p: out["macros"].append("local_apps")
-        # categories (rough)
-        for k in ["cars","auto","beauty","finance","fintech","food","travel","education","health","fitness","parenting","sports","news","shopping","entertainment","music","video","business","lifestyle"]:
-            if k in p: out["categories_raw"].append(k)
-        return out
+        info["request_id"] = getattr(resp, "id", None)
+        raw = (resp.choices[0].message.content or "").strip()
+        info["raw"] = raw
+        if not raw:
+            raise ValueError("Empty LLM response")
+        info["parsed"] = json.loads(raw)
+        return info
+    except Exception as e:
+        # Surface exact exception + stack
+        info["error"] = f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}"
+        # Fallback to heuristic so the app still works
+        info["parsed"] = heuristic_query(prompt)
+        return info
 
 # =========================
 # Dynamic filter engine
@@ -446,7 +448,19 @@ def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
         if "Content Rating Id" in d.columns:
             d = d[~d["Content Rating Id"].astype(str).str.fullmatch(r"MA", case=False)]
         if "Jounce Media" in d.columns:
-            d = d[d["Jounce Media"].astype(str).str.contains("clean", case=False, na=False)]
+            # Exact accepted clean markers in Jounce Media
+            def _norm(s: str) -> str:
+                s = str(s or "").lower().strip()
+                s = re.sub(r"\s+", " ", s)
+                s = s.replace(" / ", "/").replace(" /", "/").replace("/ ", "/")
+                return s
+            CLEAN_CANON = {
+                _norm("Clean"),
+                _norm("Clean/no joiner score attached"),
+                _norm("Clean/no jounce score attached"),
+            }
+            s = d["Jounce Media"].astype(str).map(_norm)
+            d = d[s.isin(CLEAN_CANON)]
         if "Inmobi App Name" in d.columns:
             def ok(s):
                 if not isinstance(s,str) or not s: return False
@@ -454,8 +468,19 @@ def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
                 return bad / max(1,len(s)) <= 0.3
             d = d[d["Inmobi App Name"].apply(ok)]
 
-    if "green" in macros and "Certified as Green Media" in d.columns:
-        d = d[d["Certified as Green Media"].astype(str).str.contains("true|1|yes|green", case=False, na=False)]
+    if "green" in macros:
+        green_cols = [
+            "Certified as Green Media","Scope3","Scope 3",
+            "Scope3 Certified","Scope 3 Certified",
+        ]
+        any_mask = None
+        for gc in green_cols:
+            if gc in d.columns:
+                s = d[gc].astype(str).str.lower()
+                m = s.str.contains(r"true|yes|1|green|certified|scope\s*3", na=False)
+                any_mask = m if any_mask is None else (any_mask | m)
+        if any_mask is not None:
+            d = d[any_mask]
 
     if "local_apps" in macros and {"Publisher Origin Country Name","Country Name"} <= set(d.columns):
         d = d[d["Publisher Origin Country Name"].astype(str).str.lower() == d["Country Name"].astype(str).str.lower()]
@@ -483,8 +508,12 @@ def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="Avails Bot — Smart Filters", layout="wide")
 st.title("Avails Bot — App‑level List (Smart, Schema‑Aware)")
+
+# --- Sidebar quick controls ---
+st.sidebar.header("Run options")
+safe_mode = st.sidebar.checkbox("Safe mode (ignore AI & thresholds)", value=False)
+disable_premium_thresholds = st.sidebar.checkbox("Disable premium thresholds", value=False)
 
 user_input = st.text_input("Ask anything (e.g., 'Premium rewarded video gaming apps in United States on SDK, Android')")
 
@@ -493,11 +522,50 @@ if user_input:
     df = load_df(region)
     st.caption(f"Region detected: **{region}**")
 
-    q = extract_query(user_input)
+    # quick schema debug
+    with st.expander("Debug: key counts"):
+        if "Final Format" in df.columns: st.write("Final Format:", df["Final Format"].value_counts(dropna=False))
+        if "Integration Method" in df.columns: st.write("Integration Method:", df["Integration Method"].value_counts(dropna=False))
+        if "Country Name" in df.columns: st.write("Top countries:", df["Country Name"].value_counts(dropna=False).head(20))
+
+    required_for_group = ["Inmobi App Name","Forwarded Bundle ID","Operating System Name"]
+    missing = [c for c in required_for_group if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns for grouping: {missing}. Check your Excel headers or update COLUMN_ALIASES.")
+
+    if safe_mode:
+        st.info("Safe mode ON — unfiltered, aggregated app list.")
+        g = aggregate_app_level(df.copy())
+        if g.empty:
+            st.error("Aggregation returned empty. Check APP_GROUP_KEYS columns exist.")
+        else:
+            sort_cols = [c for c in ["Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
+            if sort_cols: g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
+            show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
+            st.dataframe(g[show_cols].head(500), use_container_width=True)
+            st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"),
+                               "avails_app_level.csv", "text/csv")
+        st.stop()
+
+    # ==== Parse with LLM (and show exact errors/raw if any) ====
+    parse_info = extract_query_with_errors(user_input)
 
     with st.expander("Parsed query (debug)"):
-        st.json(q)
+        st.json(parse_info.get("parsed") or {})
 
+    with st.expander("LLM errors & raw (if any)"):
+        if parse_info.get("request_id"):
+            st.write(f"request_id: {parse_info['request_id']}")
+        if parse_info.get("error"):
+            st.error(parse_info["error"])
+        if parse_info.get("raw"):
+            st.code(parse_info["raw"], language="json")
+
+    q = parse_info.get("parsed") or {}
+
+    if not q or (not q.get("filters") and not q.get("macros") and not q.get("categories_raw") and not q.get("final_format")):
+        st.info("No filters parsed. Try adding words like 'USA', 'Android', 'Premium', 'Rewarded' or enable Safe mode.")
+    
     d = df.copy()
 
     # Apply Vertical first if present (Gaming / Non Gaming)
@@ -515,13 +583,13 @@ if user_input:
         col = filt.get("column")
         op  = filt.get("op")
         val = filt.get("value")
-        if col and alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
-            val = normalize_country(val)
         if (col or "").strip().lower() == "vertical":
             continue
+        if col and alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
+            val = normalize_country(val)
         d = apply_one_filter(d, col or "", op or "equals", val)
 
-    # categories: map user terms → dataset categories (Primary first, fallback to Inmobi App Categories)
+    # categories mapping
     cat_terms = q.get("categories_raw", []) or q.get("categories", [])
     mapped_cats = resolve_categories(cat_terms, df) if cat_terms else []
     if mapped_cats:
@@ -538,7 +606,7 @@ if user_input:
     # macros
     d = apply_macros(d, q.get("macros", []))
 
-    # Aggregate
+    # Aggregate (always returns Forwarded Bundle ID, OS, and Valid Ad Request in table)
     g = aggregate_app_level(d)
 
     # thresholds (with premium hard minimums)
@@ -546,7 +614,7 @@ if user_input:
     min_req = int(thr.get("min_requests", 0) or 0)
     min_rend = int(thr.get("min_rendered", 0) or 0)
     min_burn = float(thr.get("min_burn", 0.0) or 0.0)
-    if "premium" in (q.get("macros", []) or []):
+    if "premium" in (q.get("macros", []) or []) and not disable_premium_thresholds:
         min_req = max(min_req, 100_000)
         min_rend = max(min_rend, 10_000)
         min_burn = max(min_burn, 10.0)
@@ -563,7 +631,7 @@ if user_input:
     if "Total Burn" in g.columns and min_burn:
         g = g[g["Total Burn"] >= min_burn]
 
-    # Sort by Valid Ad Request first, then Burn, then Rendered
+    # Sort — prioritize Valid Ad Request, then Burn, then Rendered
     sort_cols = [c for c in ["Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
     if sort_cols:
         g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
