@@ -105,20 +105,25 @@ COUNTRY_SYNONYMS = {
     "uk": "United Kingdom",
 }
 
-# App-level aggregation keys
+# App-level aggregation keys (bundle + OS included)
 APP_GROUP_KEYS = [
     "Publisher Account GUID",
     "Publisher Account Name",
     "Publisher Account Type",
     "Inmobi App Inc ID",
     "Inmobi App Name",
-    "Operating System Name",
+    "Forwarded Bundle ID",     # ensure bundle is grouped
+    "Operating System Name",   # ensure OS is grouped
     "URL",
 ]
 
+# Display order (bundle + OS included)
 DISPLAY_COLS_ORDER = [
     "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
-    "Inmobi App Inc ID","Inmobi App Name","Operating System Name","URL",
+    "Inmobi App Inc ID","Inmobi App Name",
+    "Forwarded Bundle ID",
+    "Operating System Name",
+    "URL",
     "Valid Ad Request","Ad Impressions Rendered","Total Burn","eCPM",
 ]
 
@@ -209,7 +214,6 @@ def derive_vertical(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["Vertical"] = "Non Gaming"
         return df
-
     df["Vertical"] = mask.map({True: "Gaming", False: "Non Gaming"})
     return df
 
@@ -513,7 +517,6 @@ if user_input:
         val = filt.get("value")
         if col and alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
             val = normalize_country(val)
-        # skip if we already applied Vertical above (it will be idempotent but avoid rework)
         if (col or "").strip().lower() == "vertical":
             continue
         d = apply_one_filter(d, col or "", op or "equals", val)
@@ -560,7 +563,7 @@ if user_input:
     if "Total Burn" in g.columns and min_burn:
         g = g[g["Total Burn"] >= min_burn]
 
-    # Sort by Valid Ad Request first (your priority), then Burn, then Rendered
+    # Sort by Valid Ad Request first, then Burn, then Rendered
     sort_cols = [c for c in ["Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
     if sort_cols:
         g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
