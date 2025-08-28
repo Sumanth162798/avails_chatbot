@@ -9,10 +9,8 @@ import openai
 # =========================
 # Config / Constants
 # =========================
-# Toggle heuristic-only mode if LLM is flaky
 USE_LLM = True  # set False to force heuristic parser for every prompt
 
-# Show a tiny banner so you know which mode you're in
 st.set_page_config(page_title="Avails Bot — Smart Filters", layout="wide")
 mode_badge = "LLM mode" if USE_LLM else "Heuristic mode"
 st.caption(f"🔧 Parser mode: **{mode_badge}**")
@@ -21,6 +19,7 @@ st.caption(f"🔧 Parser mode: **{mode_badge}**")
 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 NUMERIC_HINTS = {
+    "Monthly Traffic",          # NEW: default volume column
     "Valid Ad Request",
     "Ad Impressions Served",
     "Valid Wins",
@@ -104,7 +103,7 @@ COLUMN_ALIASES = {
     "jounce": "Jounce Media",
     "green": "Certified as Green Media",
 
-    # Valid Ad Request variants
+    # Valid Ad Request variants (kept for compatibility)
     "valid requests": "Valid Ad Request",
     "valid ad requests": "Valid Ad Request",
     "valid ad request": "Valid Ad Request",
@@ -132,29 +131,28 @@ COUNTRY_SYNONYMS = {
     "uk": "United Kingdom",
 }
 
-# App-level aggregation keys (bundle + OS included)
+# App-level aggregation keys
 APP_GROUP_KEYS = [
     "Publisher Account GUID",
     "Publisher Account Name",
     "Publisher Account Type",
     "Inmobi App Inc ID",
     "Inmobi App Name",
-    "Forwarded Bundle ID",     # always included
-    "Operating System Name",   # always included
-    "URL",
-]
-
-# Display order (bundle + OS + Valid Ad Request included)
-DISPLAY_COLS_ORDER = [
-    "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
-    "Inmobi App Inc ID","Inmobi App Name",
     "Forwarded Bundle ID",
     "Operating System Name",
     "URL",
-    "Valid Ad Request","Ad Impressions Rendered","Total Burn","eCPM",
 ]
 
-# lightweight synonyms for categories (fallback)
+# Display order — Monthly Traffic is now default/first volume
+DISPLAY_COLS_ORDER = [
+    "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
+    "Inmobi App Inc ID","Inmobi App Name",
+    "Forwarded Bundle ID","Operating System Name","URL",
+    "Monthly Traffic",          # default volume
+    "Valid Ad Request",         # still shown if present
+    "Ad Impressions Rendered","Total Burn","eCPM",
+]
+
 CATEGORY_SYNONYMS = {
     "cars": "Automotive","auto": "Automotive","automobile": "Automotive",
     "beauty": "Beauty & Fitness","makeup": "Beauty & Fitness",
@@ -180,6 +178,15 @@ def clean_app_name(s: str) -> str:
     s = "".join(ch for ch in s if ch.isprintable())
     return re.sub(r"\s+"," ",s).strip()
 
+def clean_header(h: Any) -> str:
+    s = "" if h is None else str(h)
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(ch for ch in s if ch.isprintable())
+    s = s.replace("\xa0", " ")
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 def normalize_country(value: Optional[str]) -> Optional[str]:
     if not value: return value
     return COUNTRY_SYNONYMS.get(value.strip().lower(), value)
@@ -202,7 +209,6 @@ def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
         elif placement == "interstitial":
             return "Rewarded Video" if rewarded else "FSI"
         elif placement == "video":
-            # treat rewarded video even if Placement Type is 'Video'
             return "Rewarded Video" if rewarded else "API Video"
         elif placement == "native":
             return "Native"
@@ -211,7 +217,6 @@ def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def derive_vertical(df: pd.DataFrame) -> pd.DataFrame:
-    """Gaming if Primary Category (or Inmobi App Categories) contains game/games/gaming."""
     if "Primary Category" in df.columns:
         mask = df["Primary Category"].astype(str).str.contains(r"\bgam(e|es|ing)\b", case=False, na=False)
     elif "Inmobi App Categories" in df.columns:
@@ -224,44 +229,38 @@ def derive_vertical(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
+    cols_lower = {clean_header(c).lower(): c for c in df.columns}
     # 1) alias-based renames
-    cols_lower = {c.lower(): c for c in df.columns}
     for alias, target in COLUMN_ALIASES.items():
         if target not in df.columns and alias in cols_lower:
             rename_map[cols_lower[alias]] = target
 
-    # 2) regex-based safety nets for common header variants
-    def _lc(s): return s.lower().strip()
-
+    # 2) regex safety nets
     for c in df.columns:
-        if c in rename_map:
-            continue
-        lc = _lc(c)
+        if c in rename_map: continue
+        lc = clean_header(c).lower()
 
-        # Valid Ad Request canonicalization (aggressive)
-        # Matches: Valid Request(s), Valid Ad Request(s), Valid_Ad_Request_Count, Valid Req(s), etc.
-        if (
-            re.search(r"\bvalid\b", lc)
+        # Valid Ad Request canonicalization (for files that still use that name)
+        if (re.search(r"\bvalid\b", lc)
             and re.search(r"\b(ad|ads)?\b", lc)
-            and re.search(r"\brequest(s)?\b|\breq(s)?\b|\brequest_count\b|\breq_count\b", lc)
-        ):
+            and re.search(r"\brequest(s)?\b|\breq(s)?\b|\brequest[_\s-]*count\b|\breq[_\s-]*count\b", lc)):
             if "Valid Ad Request" not in df.columns:
                 rename_map[c] = "Valid Ad Request"
                 continue
 
-        # OS canonicalization safety
+        # OS
         if re.fullmatch(r"(os|operating\s*system(\s*name)?)", lc):
             if "Operating System Name" not in df.columns:
                 rename_map[c] = "Operating System Name"
                 continue
 
-        # Forwarded Bundle ID safety (bundle/package)
+        # Forwarded Bundle ID
         if ("bundle" in lc or "package" in lc) and "id" in lc:
             if "Forwarded Bundle ID" not in df.columns:
                 rename_map[c] = "Forwarded Bundle ID"
                 continue
 
-        # Content Rating variants
+        # Content Rating
         if re.fullmatch(r"(content\s*rating(\s*id)?)", lc):
             if "Content Rating Id" not in df.columns:
                 rename_map[c] = "Content Rating Id"
@@ -287,6 +286,7 @@ def detect_region(prompt: str) -> str:
 def load_df(region: str) -> pd.DataFrame:
     path = "na_avails.xlsx" if region == "NA" else "apac_avails.xlsx"
     df = pd.read_excel(path, engine="openpyxl")
+    df.columns = [clean_header(c) for c in df.columns]  # deep clean headers
     df = normalize_columns(df)
     if "Inmobi App Name" in df.columns:
         df["Inmobi App Name"] = df["Inmobi App Name"].apply(clean_app_name)
@@ -306,25 +306,19 @@ def build_category_vocab(df: pd.DataFrame) -> List[str]:
         for s in df["Inmobi App Categories"].dropna().astype(str):
             for piece in re.split(r"[;,|/]", s):
                 piece = piece.strip()
-                if piece:
-                    vocab.add(piece)
+                if piece: vocab.add(piece)
     vocab = {v for v in vocab if v and v.lower() != "nan"}
     return sorted(vocab)
 
 def map_categories_with_llm(raw_terms: List[str], vocab: List[str]) -> List[str]:
     if not raw_terms: return []
     try:
-        payload = {
-            "instruction": "Map user terms to the closest items in CATEGORY_VOCAB. Return JSON array of exact vocab strings.",
-            "user_terms": raw_terms,
-            "CATEGORY_VOCAB": vocab[:400]
-        }
+        payload = {"instruction": "Map user terms to the closest items in CATEGORY_VOCAB. Return JSON array of exact vocab strings.",
+                   "user_terms": raw_terms, "CATEGORY_VOCAB": vocab[:400]}
         resp = client.chat.completions.create(
             model="gpt-4o",
-            messages=[
-                {"role":"system","content":"Return only a JSON array or an object with key 'mapped'."},
-                {"role":"user","content":json.dumps(payload)}
-            ],
+            messages=[{"role":"system","content":"Return only a JSON array or an object with key 'mapped'."},
+                      {"role":"user","content":json.dumps(payload)}],
             temperature=0.0,
             response_format={"type":"json_object"},
         )
@@ -343,8 +337,7 @@ def fuzzy_map_categories(raw_terms: List[str], vocab: List[str]) -> List[str]:
         if t_syn and t_syn in vocab:
             mapped.append(t_syn); continue
         best = difflib.get_close_matches(t, vocab, n=1, cutoff=0.6)
-        if best:
-            mapped.append(best[0])
+        if best: mapped.append(best[0])
     seen = set(); out = []
     for x in mapped:
         if x not in seen:
@@ -383,45 +376,33 @@ Return compact JSON. No prose, no code fences.
 def heuristic_query(prompt: str) -> Dict[str, Any]:
     p = (prompt or "").lower()
     out = {"filters": [], "macros": [], "thresholds": {}, "categories_raw": []}
-    # country
     if any(k in p for k in ["usa","us","united states"]):
         out["filters"].append({"column":"Country Name","op":"equals","value":"United States"})
     if "india" in p: out["filters"].append({"column":"Country Name","op":"equals","value":"India"})
-    # os
     if "android" in p: out["filters"].append({"column":"Operating System Name","op":"equals","value":"Android"})
     if "ios" in p or "iphone" in p: out["filters"].append({"column":"Operating System Name","op":"equals","value":"iOS"})
-    # integration
     if "sdk" in p: out["filters"].append({"column":"Integration Method","op":"equals","value":"SDK"})
-    # formats
     if "rewarded" in p: out["filters"].append({"column":"Is Rewarded Slot","op":"is_true"})
     if "banner" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Banner"})
     if "interstitial" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
     if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
     if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
-    # gaming / non-gaming
     if "non gaming" in p or "non-gaming" in p:
         out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
     elif "gaming" in p:
         out["filters"].append({"column":"Vertical","op":"equals","value":"Gaming"})
-    # macros
     if "premium" in p or "safe" in p: out["macros"].append("premium")
     if "green" in p: out["macros"].append("green")
     if "local" in p: out["macros"].append("local_apps")
-    # categories (rough)
     for k in ["cars","auto","beauty","finance","fintech","food","travel","education","health","fitness","parenting","sports","news","shopping","entertainment","music","video","business","lifestyle"]:
         if k in p: out["categories_raw"].append(k)
     return out
 
 def extract_query_with_errors(prompt: str) -> Dict[str, Any]:
-    """
-    Returns:
-      dict with keys: parsed (dict or None), error (str or None), raw (str or None), request_id (str or None)
-    """
     info = {"parsed": None, "error": None, "raw": None, "request_id": None}
     if not USE_LLM:
         info["parsed"] = heuristic_query(prompt)
         return info
-
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -433,14 +414,11 @@ def extract_query_with_errors(prompt: str) -> Dict[str, Any]:
         info["request_id"] = getattr(resp, "id", None)
         raw = (resp.choices[0].message.content or "").strip()
         info["raw"] = raw
-        if not raw:
-            raise ValueError("Empty LLM response")
+        if not raw: raise ValueError("Empty LLM response")
         info["parsed"] = json.loads(raw)
         return info
     except Exception as e:
-        # Surface exact exception + stack
         info["error"] = f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}"
-        # Fallback to heuristic so the app still works
         info["parsed"] = heuristic_query(prompt)
         return info
 
@@ -454,9 +432,7 @@ def alias_to_canonical(col: str) -> str:
 def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) -> pd.DataFrame:
     col = alias_to_canonical(column)
     if col not in df.columns:
-        return df  # ignore unknown columns
-
-    # Policy convenience ops
+        return df
     if op in {"allowed", "blocked"} and col in POLICY_COLUMNS:
         s = df[col].astype(str).str.lower()
         truthy = s.str.contains("allow|allowed|yes|true|1|clean", na=False)
@@ -469,17 +445,13 @@ def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) 
         if pd.api.types.is_numeric_dtype(df[col]):
             return df[df[col] == pd.to_numeric(value, errors="coerce")]
         return df[series.str.casefold() == str(value).casefold()]
-
     if op == "contains":
         return df[series.str.contains(str(value), case=False, na=False)]
-
     if op in {"in","not_in"}:
         vals = value if isinstance(value, list) else [value]
         vals_lc = set(str(v).casefold() for v in vals)
         mask = series.str.casefold().isin(vals_lc)
         return df[mask] if op == "in" else df[~mask]
-
-    # numeric comparisons
     if op in {"gte","lte","gt","lt"}:
         s = pd.to_numeric(df[col], errors="coerce")
         v = pd.to_numeric(value, errors="coerce")
@@ -488,36 +460,27 @@ def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) 
         if op == "lte": return df[s <= v]
         if op == "gt":  return df[s > v]
         if op == "lt":  return df[s < v]
-
-    # booleans
     if op == "is_true":
         return df[series.str.contains("true|1|yes", case=False, na=False)]
     if op == "is_false":
         return df[~series.str.contains("true|1|yes", case=False, na=False)]
-
     return df
 
 def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
     d = df
     macros = macros or []
-
     if "premium" in macros:
         if "Integration Method" in d.columns:
             d = d[d["Integration Method"].astype(str).str.contains("sdk", case=False, na=False)]
         if "Content Rating Id" in d.columns:
             d = d[~d["Content Rating Id"].astype(str).str.fullmatch(r"MA", case=False)]
         if "Jounce Media" in d.columns:
-            # Exact accepted clean markers in Jounce Media
             def _norm(s: str) -> str:
                 s = str(s or "").lower().strip()
                 s = re.sub(r"\s+", " ", s)
                 s = s.replace(" / ", "/").replace(" /", "/").replace("/ ", "/")
                 return s
-            CLEAN_CANON = {
-                _norm("Clean"),
-                _norm("Clean/no joiner score attached"),
-                _norm("Clean/no jounce score attached"),
-            }
+            CLEAN_CANON = {_norm("Clean"), _norm("Clean/no joiner score attached"), _norm("Clean/no jounce score attached")}
             s = d["Jounce Media"].astype(str).map(_norm)
             d = d[s.isin(CLEAN_CANON)]
         if "Inmobi App Name" in d.columns:
@@ -526,12 +489,8 @@ def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
                 bad = sum(1 for ch in s if not ch.isalnum() and ch not in " ._-&()")
                 return bad / max(1,len(s)) <= 0.3
             d = d[d["Inmobi App Name"].apply(ok)]
-
     if "green" in macros:
-        green_cols = [
-            "Certified as Green Media","Scope3","Scope 3",
-            "Scope3 Certified","Scope 3 Certified",
-        ]
+        green_cols = ["Certified as Green Media","Scope3","Scope 3","Scope3 Certified","Scope 3 Certified"]
         any_mask = None
         for gc in green_cols:
             if gc in d.columns:
@@ -540,25 +499,19 @@ def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
                 any_mask = m if any_mask is None else (any_mask | m)
         if any_mask is not None:
             d = d[any_mask]
-
     if "local_apps" in macros and {"Publisher Origin Country Name","Country Name"} <= set(d.columns):
         d = d[d["Publisher Origin Country Name"].astype(str).str.lower() == d["Country Name"].astype(str).str.lower()]
-
     return d
 
 def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
     group_cols = [c for c in APP_GROUP_KEYS if c in df.columns]
     if not group_cols:
         return pd.DataFrame()
-
-    # Sum volumes; recompute eCPM later
     agg = {}
     for c in NUMERIC_HINTS:
         if c in df.columns and c != "eCPM":
             agg[c] = "sum"
     g = df.groupby(group_cols, dropna=False).agg(agg).reset_index()
-
-    # Recompute eCPM after aggregation
     if "Total Burn" in g.columns and "Ad Impressions Rendered" in g.columns:
         denom = g["Ad Impressions Rendered"].replace(0, pd.NA)
         g["eCPM"] = (g["Total Burn"] * 1000.0) / denom
@@ -567,12 +520,14 @@ def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # UI
 # =========================
-st.title("Avails Bot — App-level List (Smart, Schema-Aware)")
+st.title("Avails Bot — App-level List(Only NA & APAC for testing Purposes")
 
-# --- Sidebar quick controls ---
 st.sidebar.header("Run options")
 safe_mode = st.sidebar.checkbox("Safe mode (ignore AI & thresholds)", value=False)
 disable_premium_thresholds = st.sidebar.checkbox("Disable premium thresholds", value=False)
+if st.sidebar.button("🔁 Clear cached data"):
+    st.cache_data.clear()
+    st.experimental_rerun()
 
 user_input = st.text_input("Ask anything (e.g., 'Premium rewarded video gaming apps in United States on SDK, Android')")
 
@@ -581,17 +536,10 @@ if user_input:
     df = load_df(region)
     st.caption(f"Region detected: **{region}**")
 
-    # quick schema debug
     with st.expander("Debug: key counts"):
         if "Final Format" in df.columns: st.write("Final Format:", df["Final Format"].value_counts(dropna=False))
         if "Integration Method" in df.columns: st.write("Integration Method:", df["Integration Method"].value_counts(dropna=False))
         if "Country Name" in df.columns: st.write("Top countries:", df["Country Name"].value_counts(dropna=False).head(20))
-
-    # Immediate visibility if Valid Ad Request didn't normalize
-    if "Valid Ad Request" not in df.columns:
-        st.info("Heads-up: could not find **'Valid Ad Request'** in raw sheet after normalization. "
-                "We'll still display the column with zeros so your layout stays consistent. "
-                "Consider updating your Excel header or the normalizer.")
 
     required_for_group = ["Inmobi App Name","Forwarded Bundle ID","Operating System Name"]
     missing = [c for c in required_for_group if c not in df.columns]
@@ -601,50 +549,39 @@ if user_input:
     if safe_mode:
         st.info("Safe mode ON — unfiltered, aggregated app list.")
         g = aggregate_app_level(df.copy())
-
-        # --- SAFETY: guarantee display columns exist (so they always render) ---
+        # Guarantee default display columns exist
         for _col, _default in [
-            ("Valid Ad Request", 0),
-            ("Ad Impressions Rendered", 0),
-            ("Total Burn", 0.0),
-            ("eCPM", 0.0),
+            ("Monthly Traffic", 0), ("Valid Ad Request", 0),
+            ("Ad Impressions Rendered", 0), ("Total Burn", 0.0), ("eCPM", 0.0),
         ]:
-            if _col not in g.columns:
-                g[_col] = _default
-
+            if _col not in g.columns: g[_col] = _default
         if g.empty:
             st.error("Aggregation returned empty. Check APP_GROUP_KEYS columns exist.")
         else:
-            sort_cols = [c for c in ["Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
+            # Sort priority: Monthly Traffic (if present) → Valid Ad Request → Burn → Rendered
+            sort_cols = [c for c in ["Monthly Traffic","Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
             if sort_cols: g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
             show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
             st.dataframe(g[show_cols].head(500), use_container_width=True)
-            st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"),
-                               "avails_app_level.csv", "text/csv")
+            st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
         st.stop()
 
     # ==== Parse with LLM (and show exact errors/raw if any) ====
     parse_info = extract_query_with_errors(user_input)
-
     with st.expander("Parsed query (debug)"):
         st.json(parse_info.get("parsed") or {})
-
     with st.expander("LLM errors & raw (if any)"):
-        if parse_info.get("request_id"):
-            st.write(f"request_id: {parse_info['request_id']}")
-        if parse_info.get("error"):
-            st.error(parse_info["error"])
-        if parse_info.get("raw"):
-            st.code(parse_info["raw"], language="json")
+        if parse_info.get("request_id"): st.write(f"request_id: {parse_info['request_id']}")
+        if parse_info.get("error"): st.error(parse_info["error"])
+        if parse_info.get("raw"): st.code(parse_info["raw"], language="json")
 
     q = parse_info.get("parsed") or {}
-
     if not q or (not q.get("filters") and not q.get("macros") and not q.get("categories_raw") and not q.get("final_format")):
         st.info("No filters parsed. Try adding words like 'USA', 'Android', 'Premium', 'Rewarded' or enable Safe mode.")
-    
+
     d = df.copy()
 
-    # Apply Vertical first if present (Gaming / Non Gaming)
+    # Apply Vertical first if present
     for filt in q.get("filters", []):
         if (filt.get("column") or "").strip().lower() == "vertical" and "Vertical" in d.columns:
             d = apply_one_filter(d, "Vertical", filt.get("op","equals"), filt.get("value"))
@@ -656,11 +593,8 @@ if user_input:
 
     # general filters
     for filt in q.get("filters", []):
-        col = filt.get("column")
-        op  = filt.get("op")
-        val = filt.get("value")
-        if (col or "").strip().lower() == "vertical":
-            continue
+        col = filt.get("column"); op = filt.get("op"); val = filt.get("value")
+        if (col or "").strip().lower() == "vertical": continue
         if col and alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
             val = normalize_country(val)
         d = apply_one_filter(d, col or "", op or "equals", val)
@@ -682,50 +616,34 @@ if user_input:
     # macros
     d = apply_macros(d, q.get("macros", []))
 
-    # Aggregate (always returns Forwarded Bundle ID, OS, and Valid Ad Request in table)
+    # Aggregate
     g = aggregate_app_level(d)
 
-    # --- SAFETY: guarantee display columns exist (so they always render) ---
+    # Guarantee default display columns exist
     for _col, _default in [
-        ("Valid Ad Request", 0),
-        ("Ad Impressions Rendered", 0),
-        ("Total Burn", 0.0),
-        ("eCPM", 0.0),
+        ("Monthly Traffic", 0), ("Valid Ad Request", 0),
+        ("Ad Impressions Rendered", 0), ("Total Burn", 0.0), ("eCPM", 0.0),
     ]:
-        if _col not in g.columns:
-            g[_col] = _default
+        if _col not in g.columns: g[_col] = _default
 
-    # Optional: warn if we had to synthesize 'Valid Ad Request'
-    base_g = aggregate_app_level(df.copy())
-    synthesized_valid = ("Valid Ad Request" in g.columns) and ("Valid Ad Request" not in base_g.columns)
-    if synthesized_valid:
-        st.info("‘Valid Ad Request’ wasn’t found in the raw data after normalization — showing 0s by default. "
-                "Update your Excel header or the normalizer to populate real values.")
-
-    # thresholds (with premium hard minimums)
-    thr = q.get("thresholds", {}) or {}
-    min_req = int(thr.get("min_requests", 0) or 0)
-    min_rend = int(thr.get("min_rendered", 0) or 0)
-    min_burn = float(thr.get("min_burn", 0.0) or 0.0)
-    if "premium" in (q.get("macros", []) or []) and not disable_premium_thresholds:
-        min_req = max(min_req, 100_000)
-        min_rend = max(min_rend, 10_000)
-        min_burn = max(min_burn, 10.0)
+    # thresholds (Monthly Traffic preferred; fallback to Valid Ad Request)
+    vol_col = "Monthly Traffic" if "Monthly Traffic" in g.columns else ("Valid Ad Request" if "Valid Ad Request" in g.columns else None)
 
     st.sidebar.header("Thresholds (post-aggregation)")
-    min_req = st.sidebar.number_input("Min Valid Ad Request", 0, 100_000_000, min_req, 1000)
-    min_rend = st.sidebar.number_input("Min Ad Impressions Rendered", 0, 100_000_000, min_rend, 1000)
-    min_burn = st.sidebar.number_input("Min Total Burn ($)", 0.0, 1e9, min_burn, 1.0)
+    default_min_vol = q.get("thresholds", {}).get("min_requests", 0) or 0
+    # Premium hard minimums (apply to chosen volume column if present)
+    if "premium" in (q.get("macros", []) or []) and not disable_premium_thresholds:
+        default_min_vol = max(default_min_vol, 100_000)
+    min_vol = st.sidebar.number_input(f"Min {vol_col or 'Volume'}", 0, 1_000_000_000, int(default_min_vol), 1000) if vol_col else 0
+    min_rend = st.sidebar.number_input("Min Ad Impressions Rendered", 0, 1_000_000_000, int(q.get("thresholds", {}).get("min_rendered", 0) or 0), 1000)
+    min_burn = st.sidebar.number_input("Min Total Burn ($)", 0.0, 1e12, float(q.get("thresholds", {}).get("min_burn", 0.0) or 0.0), 1.0)
 
-    if "Valid Ad Request" in g.columns and min_req:
-        g = g[g["Valid Ad Request"] >= min_req]
-    if "Ad Impressions Rendered" in g.columns and min_rend:
-        g = g[g["Ad Impressions Rendered"] >= min_rend]
-    if "Total Burn" in g.columns and min_burn:
-        g = g[g["Total Burn"] >= min_burn]
+    if vol_col and min_vol: g = g[g[vol_col] >= min_vol]
+    if "Ad Impressions Rendered" in g.columns and min_rend: g = g[g["Ad Impressions Rendered"] >= min_rend]
+    if "Total Burn" in g.columns and min_burn: g = g[g["Total Burn"] >= min_burn]
 
-    # Sort — prioritize Valid Ad Request, then Burn, then Rendered
-    sort_cols = [c for c in ["Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
+    # Sort — Monthly Traffic → Valid Ad Request → Burn → Rendered
+    sort_cols = [c for c in ["Monthly Traffic","Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
     if sort_cols:
         g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
 
@@ -735,8 +653,7 @@ if user_input:
         show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
         st.success(f"Apps matched: {len(g)}")
         st.dataframe(g[show_cols].head(500), use_container_width=True)
-        st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"),
-                           "avails_app_level.csv", "text/csv")
+        st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
 
     with st.expander("Available columns in dataset"):
         st.write(sorted(df.columns.tolist()))
