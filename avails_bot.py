@@ -104,7 +104,19 @@ COLUMN_ALIASES = {
     "green": "Certified as Green Media",
 }
 
-COUNTRY_SYNONYMS = {
+# Canon for country comparisons (lowercased)
+COUNTRY_CANON = {
+    "usa": "united states",
+    "us": "united states",
+    "u.s.": "united states",
+    "u.s": "united states",
+    "united states": "united states",
+    "united states of america": "united states",
+    "uk": "united kingdom",
+    "united kingdom": "united kingdom",
+}
+
+COUNTRY_SYNONYMS = {  # kept for display/normalization
     "usa": "United States",
     "us": "United States",
     "u.s.": "United States",
@@ -167,9 +179,13 @@ def clean_header(h: Any) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def normalize_country(value: Optional[str]) -> Optional[str]:
+def normalize_country_display(value: Optional[str]) -> Optional[str]:
     if not value: return value
     return COUNTRY_SYNONYMS.get(value.strip().lower(), value)
+
+def canonicalize_country_value(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    return COUNTRY_CANON.get(s, s)
 
 def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     for c in BOOL_LIKE_HINTS:
@@ -180,28 +196,22 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-# ---- NEW: canonicalize Vertical values everywhere ----
+# ---- Canonicalize Vertical values everywhere ----
 def canonicalize_vertical_value(v: Any) -> Optional[str]:
     s = str(v or "").lower()
-    # normalize separators
-    s = re.sub(r"[^a-z]+", " ", s)     # keep letters, turn others into spaces
-    s = re.sub(r"\s+", " ", s).strip() # collapse spaces
-    if not s:
-        return None
-    if re.fullmatch(r"gaming", s):
-        return "Gaming"
-    if re.fullmatch(r"non\s*gaming", s) or re.fullmatch(r"non\s*game(s|ing)?", s):
-        return "Non Gaming"
-    # leave unknowns unmapped
-    return None
+    s = re.sub(r"[^a-z]+", " ", s)     # keep letters; others → spaces
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s: return None
+    if s == "gaming": return "Gaming"
+    if re.fullmatch(r"non\s*gaming", s): return "Non Gaming"
+    return None  # unknown stays as-is
 
 def normalize_vertical_column(df: pd.DataFrame) -> pd.DataFrame:
     if "Vertical" in df.columns:
         canon = df["Vertical"].map(canonicalize_vertical_value)
-        # fill back original where we couldn't map confidently
         df["Vertical"] = canon.fillna(df["Vertical"])
     return df
-# ------------------------------------------------------
+# -------------------------------------------------
 
 def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
     def derive_final_format(row) -> str:
@@ -292,6 +302,10 @@ def load_df(region: str) -> pd.DataFrame:
     df = apply_final_format(df)
     df = derive_vertical(df)
     df = normalize_vertical_column(df)  # ensure canonical after derivation
+    # OPTIONAL: make country labels neat while keeping comparisons canonical
+    if "Country Name" in df.columns:
+        # keep original for display if you want; here we leave values as-is
+        pass
     df = coerce_types(df)
     return df
 
@@ -453,11 +467,18 @@ def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) 
     if op == "equals":
         if pd.api.types.is_numeric_dtype(df[col]):
             return df[df[col] == pd.to_numeric(value, errors="coerce")]
-        # for strings, compare after light canonicalization when Vertical
+
+        # Special: normalize Vertical & Country Name comparisons
         if col == "Vertical":
-            # compare with a normalized series
             series_norm = df[col].map(canonicalize_vertical_value).fillna(series)
             return df[series_norm.str.casefold() == str(value).casefold()]
+
+        if col == "Country Name":
+            series_norm = df[col].apply(canonicalize_country_value)
+            value_norm = canonicalize_country_value(value)
+            return df[series_norm == value_norm]
+
+        # default string equals
         return df[series.str.casefold() == str(value).casefold()]
 
     if op == "contains":
@@ -589,18 +610,18 @@ if user_input:
     parse_info = extract_query_with_errors(user_input)
     q = parse_info.get("parsed") or {}
 
-    # Force Vertical from user text if LLM missed it (strict split via Vertical)
+    # --- HARD ENFORCEMENT: derive the Vertical filter directly from user text ---
     text_lc = (user_input or "").lower()
-    def _has_vertical_filter(qobj, val):
-        for f in (qobj.get("filters") or []):
-            if (f.get("column","").strip().lower() == "vertical" and
-                str(f.get("value","")).strip().lower() == val.lower()):
-                return True
-        return False
-    if re.search(r"\bnon[-_\s]?gaming\b", text_lc) and not _has_vertical_filter(q, "Non Gaming"):
-        q.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Non Gaming"})
-    elif re.search(r"\bgaming\b", text_lc) and not _has_vertical_filter(q, "Gaming"):
-        q.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Gaming"})
+    def ensure_vertical_filter(qobj, text):
+        # remove any existing Vertical filters first (avoid duplicates / contradictions)
+        qobj["filters"] = [f for f in (qobj.get("filters") or []) if f.get("column","").strip().lower() != "vertical"]
+        if re.search(r"\bnon[-_\s]?gaming\b", text):
+            qobj.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Non Gaming"})
+        elif re.search(r"\bgaming\b", text):
+            qobj.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Gaming"})
+        return qobj
+    q = ensure_vertical_filter(q, text_lc)
+    # ---------------------------------------------------------------------------
 
     with st.expander("Parsed query (debug)"):
         st.json(q)
@@ -617,17 +638,25 @@ if user_input:
         if (filt.get("column") or "").strip().lower() == "vertical" and "Vertical" in d.columns:
             d = apply_one_filter(d, "Vertical", filt.get("op","equals"), filt.get("value"))
 
-    # final_format if present
+    # final_format if present (robust rewarded handling)
     ff = q.get("final_format")
     if ff and "Final Format" in d.columns:
-        d = apply_one_filter(d, "Final Format", "equals", ff)
+        if ff == "Rewarded Video":
+            mask = d["Final Format"].astype(str).str.casefold().eq("rewarded video")
+            if "Is Rewarded Slot" in d.columns:
+                mask = mask | d["Is Rewarded Slot"].astype(str).str.contains("true|1|yes", case=False, na=False)
+            d = d[mask]
+        else:
+            d = apply_one_filter(d, "Final Format", "equals", ff)
 
     # general filters (non-Vertical)
     for filt in q.get("filters", []):
-        col = filt.get("column"); op = filt.get("op"); val = filt.get("value")
-        if (col or "").strip().lower() == "vertical": continue
-        if col and alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
-            val = normalize_country(val)
+        col = (filt.get("column") or "").strip()
+        if col.lower() == "vertical": continue
+        op = filt.get("op"); val = filt.get("value")
+        if alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
+            # don't transform display; canonicalize only for compare inside apply_one_filter
+            pass
         d = apply_one_filter(d, col or "", op or "equals", val)
 
     # categories mapping (ONLY for specific asks)
@@ -664,11 +693,9 @@ if user_input:
     ]:
         if _col not in g.columns: g[_col] = _default
 
-    # thresholds — Monthly Traffic only as volume
+    # thresholds — NO hidden premium floor
     st.sidebar.header("Thresholds (post-aggregation)")
     default_min_vol = q.get("thresholds", {}).get("min_requests", 0) or 0
-    if "premium" in (q.get("macros", []) or []) and not disable_premium_thresholds:
-        default_min_vol = max(default_min_vol, 100_000)
 
     vol_col = "Monthly Traffic" if "Monthly Traffic" in g.columns else None
     min_vol = st.sidebar.number_input(f"Min {vol_col or 'Volume'}", 0, 1_000_000_000, int(default_min_vol), 1000) if vol_col else 0
@@ -683,6 +710,55 @@ if user_input:
     sort_cols = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g.columns]
     if sort_cols:
         g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
+
+    # Graceful fallbacks if empty
+    if g.empty:
+        # 1) Drop thresholds only
+        d_no_thresh = d.copy()
+        g_no_thresh = aggregate_app_level(d_no_thresh)
+        for _col, _default in [("Monthly Traffic",0),("Ad Impressions Rendered",0),("Total Burn",0.0),("eCPM",0.0)]:
+            if _col not in g_no_thresh.columns: g_no_thresh[_col] = _default
+        if not g_no_thresh.empty:
+            st.info("No rows met your thresholds. Showing results with the same filters but **without thresholds**.")
+            sort_cols2 = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g_no_thresh.columns]
+            if sort_cols2: g_no_thresh = g_no_thresh.sort_values(sort_cols2, ascending=[False]*len(sort_cols2))
+            show_cols2 = [c for c in DISPLAY_COLS_ORDER if c in g_no_thresh.columns]
+            st.dataframe(g_no_thresh[show_cols2].head(500), use_container_width=True)
+            st.download_button("Download CSV (no thresholds)", g_no_thresh.to_csv(index=False).encode("utf-8"), "avails_no_thresholds.csv", "text/csv")
+            st.stop()
+
+        # 2) If strict Rewarded was requested, relax to rewarded slot
+        if ff == "Rewarded Video" and "Final Format" in df.columns:
+            d_relaxed = df.copy()
+            d_relaxed = normalize_vertical_column(d_relaxed)
+            # Re-apply Vertical
+            for filt in q.get("filters", []):
+                if (filt.get("column") or "").strip().lower() == "vertical":
+                    d_relaxed = apply_one_filter(d_relaxed, "Vertical", filt.get("op","equals"), filt.get("value"))
+            # Re-apply other filters except Final Format
+            for filt in q.get("filters", []):
+                col = (filt.get("column") or "").strip().lower()
+                if col in {"vertical","final format"}: 
+                    continue
+                d_relaxed = apply_one_filter(d_relaxed, filt.get("column") or "", filt.get("op") or "equals", filt.get("value"))
+            # Keep rewarded by slot flag
+            if "Is Rewarded Slot" in d_relaxed.columns:
+                d_relaxed = d_relaxed[d_relaxed["Is Rewarded Slot"].astype(str).str.contains("true|1|yes", case=False, na=False)]
+            d_relaxed = apply_macros(d_relaxed, q.get("macros", []))
+            g_relaxed = aggregate_app_level(d_relaxed)
+            for _col, _default in [("Monthly Traffic",0),("Ad Impressions Rendered",0),("Total Burn",0.0),("eCPM",0.0)]:
+                if _col not in g_relaxed.columns: g_relaxed[_col] = _default
+            if not g_relaxed.empty:
+                st.info("No rows with strict 'Rewarded Video'. Showing **rewarded slots** (relaxed) with your other filters.")
+                sort_cols3 = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g_relaxed.columns]
+                if sort_cols3: g_relaxed = g_relaxed.sort_values(sort_cols3, ascending=[False]*len(sort_cols3))
+                show_cols3 = [c for c in DISPLAY_COLS_ORDER if c in g_relaxed.columns]
+                st.dataframe(g_relaxed[show_cols3].head(500), use_container_width=True)
+                st.download_button("Download CSV (rewarded relaxed)", g_relaxed.to_csv(index=False).encode("utf-8"), "avails_rewarded_relaxed.csv", "text/csv")
+                st.stop()
+
+        st.warning("No results. Try lowering thresholds or removing 'rewarded'/'premium'.")
+        st.stop()
 
     if g.empty:
         st.warning("No results. Loosen filters or thresholds.")
