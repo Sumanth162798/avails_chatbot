@@ -18,7 +18,7 @@ st.caption(f"🔧 Parser mode: **{mode_badge}**")
 # OpenAI client (expects OPENAI_API_KEY in Streamlit secrets)
 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# NOTE: Removed "Valid Ad Request" everywhere
+# NOTE: No "Valid Ad Request" anywhere
 NUMERIC_HINTS = {
     "Monthly Traffic",          # default volume column
     "Ad Impressions Served",
@@ -48,8 +48,7 @@ POLICY_COLUMNS = {
     "KuCoin.com",
 }
 
-# natural aliases → real columns (expanded)
-# NOTE: Removed all aliases that pointed to "Valid Ad Request"
+# natural aliases → real columns (no Valid Ad Request aliases)
 COLUMN_ALIASES = {
     # Country / OS
     "country": "Country Name",
@@ -126,7 +125,6 @@ APP_GROUP_KEYS = [
 ]
 
 # Display order — Monthly Traffic is the default/first volume
-# NOTE: Removed "Valid Ad Request"
 DISPLAY_COLS_ORDER = [
     "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
     "Inmobi App Inc ID","Inmobi App Name",
@@ -199,6 +197,9 @@ def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def derive_vertical(df: pd.DataFrame) -> pd.DataFrame:
+    # Derive Vertical if needed from category text; prefer existing "Vertical" if provided.
+    if "Vertical" in df.columns:
+        return df
     if "Primary Category" in df.columns:
         mask = df["Primary Category"].astype(str).str.contains(r"\bgam(e|es|ing)\b", case=False, na=False)
     elif "Inmobi App Categories" in df.columns:
@@ -217,7 +218,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         if target not in df.columns and alias in cols_lower:
             rename_map[cols_lower[alias]] = target
 
-    # 2) regex safety nets — NOTE: removed the Valid Ad Request canonicalization
+    # 2) regex safety nets — (no Valid Ad Request canonicalization)
     for c in df.columns:
         if c in rename_map: continue
         lc = clean_header(c).lower()
@@ -270,7 +271,7 @@ def load_df(region: str) -> pd.DataFrame:
     return df
 
 # =========================
-# Category vocabulary & mapping
+# Category vocabulary & mapping (for specific asks)
 # =========================
 def build_category_vocab(df: pd.DataFrame) -> List[str]:
     vocab: Set[str] = set()
@@ -339,11 +340,13 @@ Guidance:
 - "USA"/"US" => "United States" for column "Country Name".
 - "SDK integration" => {"column":"Integration Method","op":"equals","value":"SDK"}.
 - "rewarded video" => final_format "Rewarded Video" and/or {"column":"Is Rewarded Slot","op":"is_true"}.
-- If user says "gaming" or "non gaming", add a filter on column "Vertical" equals "Gaming"/"Non Gaming".
+- If the user says "gaming" or "non gaming", you MUST add {"column":"Vertical","op":"equals","value":"Gaming"/"Non Gaming"}.
+  Do NOT treat "gaming" only as a free-text category.
 - If user says "premium"/"safe", add macro "premium".
 - If user says "green media", add macro "green".
 - "local apps" => macro "local_apps".
 - If user implies categories (e.g., "cars","fashion","fintech","education"), put them into categories_raw.
+  Categories_raw must be matched against "Inmobi App Categories" or "Primary Category" (NOT against Vertical).
 Return compact JSON. No prose, no code fences.
 """
 
@@ -361,9 +364,9 @@ def heuristic_query(prompt: str) -> Dict[str, Any]:
     if "interstitial" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
     if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
     if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
-    if "non gaming" in p or "non-gaming" in p:
+    if re.search(r"\bnon[-\s]?gaming\b", p):
         out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
-    elif "gaming" in p:
+    elif re.search(r"\bgaming\b", p):
         out["filters"].append({"column":"Vertical","op":"equals","value":"Gaming"})
     if "premium" in p or "safe" in p: out["macros"].append("premium")
     if "green" in p: out["macros"].append("green")
@@ -514,6 +517,7 @@ if user_input:
         if "Final Format" in df.columns: st.write("Final Format:", df["Final Format"].value_counts(dropna=False))
         if "Integration Method" in df.columns: st.write("Integration Method:", df["Integration Method"].value_counts(dropna=False))
         if "Country Name" in df.columns: st.write("Top countries:", df["Country Name"].value_counts(dropna=False).head(20))
+        if "Vertical" in df.columns: st.write("Vertical (raw):", df["Vertical"].value_counts(dropna=False))
 
     required_for_group = ["Inmobi App Name","Forwarded Bundle ID","Operating System Name"]
     missing = [c for c in required_for_group if c not in df.columns]
@@ -523,7 +527,7 @@ if user_input:
     if safe_mode:
         st.info("Safe mode ON — unfiltered, aggregated app list.")
         g = aggregate_app_level(df.copy())
-        # Guarantee default display columns exist (NO Valid Ad Request)
+        # Guarantee default display columns exist
         for _col, _default in [
             ("Monthly Traffic", 0),
             ("Ad Impressions Rendered", 0),
@@ -544,20 +548,32 @@ if user_input:
 
     # ==== Parse with LLM (and show exact errors/raw if any) ====
     parse_info = extract_query_with_errors(user_input)
+    q = parse_info.get("parsed") or {}
+
+    # --- Force Vertical from user text if LLM missed it (strict Gaming split via Vertical) ---
+    text_lc = (user_input or "").lower()
+    def _has_vertical_filter(qobj, val):
+        for f in (qobj.get("filters") or []):
+            if (f.get("column","").strip().lower() == "vertical" and
+                str(f.get("value","")).strip().lower() == val.lower()):
+                return True
+        return False
+    if re.search(r"\bnon[-\s]?gaming\b", text_lc) and not _has_vertical_filter(q, "Non Gaming"):
+        q.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Non Gaming"})
+    elif re.search(r"\bgaming\b", text_lc) and not _has_vertical_filter(q, "Gaming"):
+        q.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Gaming"})
+    # --- end guard ---
+
     with st.expander("Parsed query (debug)"):
-        st.json(parse_info.get("parsed") or {})
+        st.json(q)
     with st.expander("LLM errors & raw (if any)"):
         if parse_info.get("request_id"): st.write(f"request_id: {parse_info['request_id']}")
         if parse_info.get("error"): st.error(parse_info["error"])
         if parse_info.get("raw"): st.code(parse_info["raw"], language="json")
 
-    q = parse_info.get("parsed") or {}
-    if not q or (not q.get("filters") and not q.get("macros") and not q.get("categories_raw") and not q.get("final_format")):
-        st.info("No filters parsed. Try adding words like 'USA', 'Android', 'Premium', 'Rewarded' or enable Safe mode.")
-
     d = df.copy()
 
-    # Apply Vertical first if present
+    # Apply Vertical first (authoritative split)
     for filt in q.get("filters", []):
         if (filt.get("column") or "").strip().lower() == "vertical" and "Vertical" in d.columns:
             d = apply_one_filter(d, "Vertical", filt.get("op","equals"), filt.get("value"))
@@ -567,7 +583,7 @@ if user_input:
     if ff and "Final Format" in d.columns:
         d = apply_one_filter(d, "Final Format", "equals", ff)
 
-    # general filters
+    # general filters (non-Vertical)
     for filt in q.get("filters", []):
         col = filt.get("column"); op = filt.get("op"); val = filt.get("value")
         if (col or "").strip().lower() == "vertical": continue
@@ -575,7 +591,7 @@ if user_input:
             val = normalize_country(val)
         d = apply_one_filter(d, col or "", op or "equals", val)
 
-    # categories mapping
+    # categories mapping (ONLY for specific asks — not for Gaming split)
     cat_terms = q.get("categories_raw", []) or q.get("categories", [])
     mapped_cats = resolve_categories(cat_terms, df) if cat_terms else []
     if mapped_cats:
@@ -592,10 +608,15 @@ if user_input:
     # macros
     d = apply_macros(d, q.get("macros", []))
 
+    # Debug after filters
+    with st.expander("Debug after filters"):
+        if "Vertical" in d.columns:
+            st.write("Vertical counts (post-filter):", d["Vertical"].value_counts(dropna=False))
+
     # Aggregate
     g = aggregate_app_level(d)
 
-    # Guarantee default display columns exist (NO Valid Ad Request)
+    # Guarantee default display columns exist
     for _col, _default in [
         ("Monthly Traffic", 0),
         ("Ad Impressions Rendered", 0),
@@ -604,7 +625,7 @@ if user_input:
     ]:
         if _col not in g.columns: g[_col] = _default
 
-    # thresholds — Monthly Traffic only (as primary volume)
+    # thresholds — Monthly Traffic only as volume
     st.sidebar.header("Thresholds (post-aggregation)")
     default_min_vol = q.get("thresholds", {}).get("min_requests", 0) or 0
     if "premium" in (q.get("macros", []) or []) and not disable_premium_thresholds:
