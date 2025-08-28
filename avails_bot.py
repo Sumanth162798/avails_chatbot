@@ -20,7 +20,7 @@ client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # NOTE: No "Valid Ad Request" anywhere
 NUMERIC_HINTS = {
-    "Monthly Traffic",          # default volume column
+    "Monthly Traffic",
     "Ad Impressions Served",
     "Valid Wins",
     "Ad Impressions Rendered",
@@ -124,7 +124,7 @@ APP_GROUP_KEYS = [
     "URL",
 ]
 
-# Display order — Monthly Traffic is the default/first volume
+# Display order
 DISPLAY_COLS_ORDER = [
     "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
     "Inmobi App Inc ID","Inmobi App Name",
@@ -180,6 +180,29 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
+# ---- NEW: canonicalize Vertical values everywhere ----
+def canonicalize_vertical_value(v: Any) -> Optional[str]:
+    s = str(v or "").lower()
+    # normalize separators
+    s = re.sub(r"[^a-z]+", " ", s)     # keep letters, turn others into spaces
+    s = re.sub(r"\s+", " ", s).strip() # collapse spaces
+    if not s:
+        return None
+    if re.fullmatch(r"gaming", s):
+        return "Gaming"
+    if re.fullmatch(r"non\s*gaming", s) or re.fullmatch(r"non\s*game(s|ing)?", s):
+        return "Non Gaming"
+    # leave unknowns unmapped
+    return None
+
+def normalize_vertical_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "Vertical" in df.columns:
+        canon = df["Vertical"].map(canonicalize_vertical_value)
+        # fill back original where we couldn't map confidently
+        df["Vertical"] = canon.fillna(df["Vertical"])
+    return df
+# ------------------------------------------------------
+
 def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
     def derive_final_format(row) -> str:
         placement = str(row.get("Placement Type","")).strip().lower()
@@ -197,9 +220,10 @@ def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def derive_vertical(df: pd.DataFrame) -> pd.DataFrame:
-    # Derive Vertical if needed from category text; prefer existing "Vertical" if provided.
+    # Prefer existing "Vertical" but canonicalize it
     if "Vertical" in df.columns:
-        return df
+        return normalize_vertical_column(df)
+    # Otherwise derive from categories
     if "Primary Category" in df.columns:
         mask = df["Primary Category"].astype(str).str.contains(r"\bgam(e|es|ing)\b", case=False, na=False)
     elif "Inmobi App Categories" in df.columns:
@@ -218,7 +242,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         if target not in df.columns and alias in cols_lower:
             rename_map[cols_lower[alias]] = target
 
-    # 2) regex safety nets — (no Valid Ad Request canonicalization)
+    # 2) regex safety nets
     for c in df.columns:
         if c in rename_map: continue
         lc = clean_header(c).lower()
@@ -267,6 +291,7 @@ def load_df(region: str) -> pd.DataFrame:
         df["Inmobi App Name"] = df["Inmobi App Name"].apply(clean_app_name)
     df = apply_final_format(df)
     df = derive_vertical(df)
+    df = normalize_vertical_column(df)  # ensure canonical after derivation
     df = coerce_types(df)
     return df
 
@@ -364,7 +389,7 @@ def heuristic_query(prompt: str) -> Dict[str, Any]:
     if "interstitial" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
     if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
     if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
-    if re.search(r"\bnon[-\s]?gaming\b", p):
+    if re.search(r"\bnon[-_\s]?gaming\b", p):
         out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
     elif re.search(r"\bgaming\b", p):
         out["filters"].append({"column":"Vertical","op":"equals","value":"Gaming"})
@@ -410,6 +435,13 @@ def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) 
     col = alias_to_canonical(column)
     if col not in df.columns:
         return df
+
+    # Canonicalize expected value for Vertical comparisons
+    if col == "Vertical" and op == "equals":
+        v_can = canonicalize_vertical_value(value)
+        if v_can:
+            value = v_can
+
     if op in {"allowed", "blocked"} and col in POLICY_COLUMNS:
         s = df[col].astype(str).str.lower()
         truthy = s.str.contains("allow|allowed|yes|true|1|clean", na=False)
@@ -421,14 +453,22 @@ def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) 
     if op == "equals":
         if pd.api.types.is_numeric_dtype(df[col]):
             return df[df[col] == pd.to_numeric(value, errors="coerce")]
+        # for strings, compare after light canonicalization when Vertical
+        if col == "Vertical":
+            # compare with a normalized series
+            series_norm = df[col].map(canonicalize_vertical_value).fillna(series)
+            return df[series_norm.str.casefold() == str(value).casefold()]
         return df[series.str.casefold() == str(value).casefold()]
+
     if op == "contains":
         return df[series.str.contains(str(value), case=False, na=False)]
+
     if op in {"in","not_in"}:
         vals = value if isinstance(value, list) else [value]
         vals_lc = set(str(v).casefold() for v in vals)
         mask = series.str.casefold().isin(vals_lc)
         return df[mask] if op == "in" else df[~mask]
+
     if op in {"gte","lte","gt","lt"}:
         s = pd.to_numeric(df[col], errors="coerce")
         v = pd.to_numeric(value, errors="coerce")
@@ -437,6 +477,7 @@ def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) 
         if op == "lte": return df[s <= v]
         if op == "gt":  return df[s > v]
         if op == "lt":  return df[s < v]
+
     if op == "is_true":
         return df[series.str.contains("true|1|yes", case=False, na=False)]
     if op == "is_false":
@@ -517,7 +558,7 @@ if user_input:
         if "Final Format" in df.columns: st.write("Final Format:", df["Final Format"].value_counts(dropna=False))
         if "Integration Method" in df.columns: st.write("Integration Method:", df["Integration Method"].value_counts(dropna=False))
         if "Country Name" in df.columns: st.write("Top countries:", df["Country Name"].value_counts(dropna=False).head(20))
-        if "Vertical" in df.columns: st.write("Vertical (raw):", df["Vertical"].value_counts(dropna=False))
+        if "Vertical" in df.columns: st.write("Vertical (raw/canonical):", df["Vertical"].value_counts(dropna=False))
 
     required_for_group = ["Inmobi App Name","Forwarded Bundle ID","Operating System Name"]
     missing = [c for c in required_for_group if c not in df.columns]
@@ -527,7 +568,6 @@ if user_input:
     if safe_mode:
         st.info("Safe mode ON — unfiltered, aggregated app list.")
         g = aggregate_app_level(df.copy())
-        # Guarantee default display columns exist
         for _col, _default in [
             ("Monthly Traffic", 0),
             ("Ad Impressions Rendered", 0),
@@ -538,7 +578,6 @@ if user_input:
         if g.empty:
             st.error("Aggregation returned empty. Check APP_GROUP_KEYS columns exist.")
         else:
-            # Sort priority: Monthly Traffic → Burn → Rendered
             sort_cols = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g.columns]
             if sort_cols: g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
             show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
@@ -550,7 +589,7 @@ if user_input:
     parse_info = extract_query_with_errors(user_input)
     q = parse_info.get("parsed") or {}
 
-    # --- Force Vertical from user text if LLM missed it (strict Gaming split via Vertical) ---
+    # Force Vertical from user text if LLM missed it (strict split via Vertical)
     text_lc = (user_input or "").lower()
     def _has_vertical_filter(qobj, val):
         for f in (qobj.get("filters") or []):
@@ -558,11 +597,10 @@ if user_input:
                 str(f.get("value","")).strip().lower() == val.lower()):
                 return True
         return False
-    if re.search(r"\bnon[-\s]?gaming\b", text_lc) and not _has_vertical_filter(q, "Non Gaming"):
+    if re.search(r"\bnon[-_\s]?gaming\b", text_lc) and not _has_vertical_filter(q, "Non Gaming"):
         q.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Non Gaming"})
     elif re.search(r"\bgaming\b", text_lc) and not _has_vertical_filter(q, "Gaming"):
         q.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Gaming"})
-    # --- end guard ---
 
     with st.expander("Parsed query (debug)"):
         st.json(q)
@@ -573,7 +611,8 @@ if user_input:
 
     d = df.copy()
 
-    # Apply Vertical first (authoritative split)
+    # Apply Vertical first (authoritative split, after normalizing column)
+    d = normalize_vertical_column(d)
     for filt in q.get("filters", []):
         if (filt.get("column") or "").strip().lower() == "vertical" and "Vertical" in d.columns:
             d = apply_one_filter(d, "Vertical", filt.get("op","equals"), filt.get("value"))
@@ -591,7 +630,7 @@ if user_input:
             val = normalize_country(val)
         d = apply_one_filter(d, col or "", op or "equals", val)
 
-    # categories mapping (ONLY for specific asks — not for Gaming split)
+    # categories mapping (ONLY for specific asks)
     cat_terms = q.get("categories_raw", []) or q.get("categories", [])
     mapped_cats = resolve_categories(cat_terms, df) if cat_terms else []
     if mapped_cats:
