@@ -49,7 +49,7 @@ POLICY_COLUMNS = {
     "KuCoin.com",
 }
 
-# natural aliases → real columns
+# natural aliases → real columns (expanded)
 COLUMN_ALIASES = {
     # Country / OS
     "country": "Country Name",
@@ -103,6 +103,17 @@ COLUMN_ALIASES = {
     "url": "URL",
     "jounce": "Jounce Media",
     "green": "Certified as Green Media",
+
+    # Valid Ad Request variants
+    "valid requests": "Valid Ad Request",
+    "valid ad requests": "Valid Ad Request",
+    "valid ad request": "Valid Ad Request",
+    "valid req": "Valid Ad Request",
+    "valid ad req": "Valid Ad Request",
+    "valid_ad_requests": "Valid Ad Request",
+    "valid_ad_request": "Valid Ad Request",
+    "valid ad-requests": "Valid Ad Request",
+    "valid ad_request": "Valid Ad Request",
 }
 
 COUNTRY_SYNONYMS = {
@@ -205,12 +216,47 @@ def derive_vertical(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
+    # 1) alias-based renames
     cols_lower = {c.lower(): c for c in df.columns}
     for alias, target in COLUMN_ALIASES.items():
         if target not in df.columns and alias in cols_lower:
             rename_map[cols_lower[alias]] = target
+
+    # 2) regex-based safety nets for common header variants
+    def _lc(s): return s.lower().strip()
+
+    for c in df.columns:
+        if c in rename_map:
+            continue
+        lc = _lc(c)
+
+        # Valid Ad Request canonicalization
+        if re.search(r"\bvalid\b", lc) and re.search(r"\bad\b", lc) and re.search(r"\brequest", lc):
+            if "Valid Ad Request" not in df.columns:
+                rename_map[c] = "Valid Ad Request"
+                continue
+
+        # OS canonicalization safety
+        if re.fullmatch(r"(os|operating\s*system(\s*name)?)", lc):
+            if "Operating System Name" not in df.columns:
+                rename_map[c] = "Operating System Name"
+                continue
+
+        # Forwarded Bundle ID safety (bundle/package)
+        if ("bundle" in lc or "package" in lc) and "id" in lc:
+            if "Forwarded Bundle ID" not in df.columns:
+                rename_map[c] = "Forwarded Bundle ID"
+                continue
+
+        # Content Rating variants
+        if re.fullmatch(r"(content\s*rating(\s*id)?)", lc):
+            if "Content Rating Id" not in df.columns:
+                rename_map[c] = "Content Rating Id"
+                continue
+
     if rename_map:
         df = df.rename(columns=rename_map)
+
     return df
 
 # =========================
@@ -508,7 +554,7 @@ def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # UI
 # =========================
-st.title("Avails Bot — App‑level List (Smart, Schema‑Aware)")
+st.title("Avails Bot — App-level List (Smart, Schema-Aware)")
 
 # --- Sidebar quick controls ---
 st.sidebar.header("Run options")
@@ -619,7 +665,7 @@ if user_input:
         min_rend = max(min_rend, 10_000)
         min_burn = max(min_burn, 10.0)
 
-    st.sidebar.header("Thresholds (post‑aggregation)")
+    st.sidebar.header("Thresholds (post-aggregation)")
     min_req = st.sidebar.number_input("Min Valid Ad Request", 0, 100_000_000, min_req, 1000)
     min_rend = st.sidebar.number_input("Min Ad Impressions Rendered", 0, 100_000_000, min_rend, 1000)
     min_burn = st.sidebar.number_input("Min Total Burn ($)", 0.0, 1e9, min_burn, 1.0)
