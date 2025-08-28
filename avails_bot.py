@@ -18,9 +18,9 @@ st.caption(f"🔧 Parser mode: **{mode_badge}**")
 # OpenAI client (expects OPENAI_API_KEY in Streamlit secrets)
 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
+# NOTE: Removed "Valid Ad Request" everywhere
 NUMERIC_HINTS = {
-    "Monthly Traffic",          # NEW: default volume column
-    "Valid Ad Request",
+    "Monthly Traffic",          # default volume column
     "Ad Impressions Served",
     "Valid Wins",
     "Ad Impressions Rendered",
@@ -49,6 +49,7 @@ POLICY_COLUMNS = {
 }
 
 # natural aliases → real columns (expanded)
+# NOTE: Removed all aliases that pointed to "Valid Ad Request"
 COLUMN_ALIASES = {
     # Country / OS
     "country": "Country Name",
@@ -102,25 +103,6 @@ COLUMN_ALIASES = {
     "url": "URL",
     "jounce": "Jounce Media",
     "green": "Certified as Green Media",
-
-    # Valid Ad Request variants (kept for compatibility)
-    "valid requests": "Valid Ad Request",
-    "valid ad requests": "Valid Ad Request",
-    "valid ad request": "Valid Ad Request",
-    "valid req": "Valid Ad Request",
-    "valid ad req": "Valid Ad Request",
-    "valid_ad_requests": "Valid Ad Request",
-    "valid_ad_request": "Valid Ad Request",
-    "valid ad-requests": "Valid Ad Request",
-    "valid ad_request": "Valid Ad Request",
-    "valid requests count": "Valid Ad Request",
-    "valid request count": "Valid Ad Request",
-    "valid reqs": "Valid Ad Request",
-    "valid requests_total": "Valid Ad Request",
-    "valid_request_count": "Valid Ad Request",
-    "valid_req_count": "Valid Ad Request",
-    "validadrequest": "Valid Ad Request",
-    "valid_ad_req_count": "Valid Ad Request",
 }
 
 COUNTRY_SYNONYMS = {
@@ -143,13 +125,13 @@ APP_GROUP_KEYS = [
     "URL",
 ]
 
-# Display order — Monthly Traffic is now default/first volume
+# Display order — Monthly Traffic is the default/first volume
+# NOTE: Removed "Valid Ad Request"
 DISPLAY_COLS_ORDER = [
     "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
     "Inmobi App Inc ID","Inmobi App Name",
     "Forwarded Bundle ID","Operating System Name","URL",
-    "Monthly Traffic",          # default volume
-    "Valid Ad Request",         # still shown if present
+    "Monthly Traffic",
     "Ad Impressions Rendered","Total Burn","eCPM",
 ]
 
@@ -235,18 +217,10 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         if target not in df.columns and alias in cols_lower:
             rename_map[cols_lower[alias]] = target
 
-    # 2) regex safety nets
+    # 2) regex safety nets — NOTE: removed the Valid Ad Request canonicalization
     for c in df.columns:
         if c in rename_map: continue
         lc = clean_header(c).lower()
-
-        # Valid Ad Request canonicalization (for files that still use that name)
-        if (re.search(r"\bvalid\b", lc)
-            and re.search(r"\b(ad|ads)?\b", lc)
-            and re.search(r"\brequest(s)?\b|\breq(s)?\b|\brequest[_\s-]*count\b|\breq[_\s-]*count\b", lc)):
-            if "Valid Ad Request" not in df.columns:
-                rename_map[c] = "Valid Ad Request"
-                continue
 
         # OS
         if re.fullmatch(r"(os|operating\s*system(\s*name)?)", lc):
@@ -520,7 +494,7 @@ def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # UI
 # =========================
-st.title("Avails Bot — App-level List(Only NA & APAC for testing Purposes)")
+st.title("Avails Bot — App-level List (Smart, Schema-Aware)")
 
 st.sidebar.header("Run options")
 safe_mode = st.sidebar.checkbox("Safe mode (ignore AI & thresholds)", value=False)
@@ -549,17 +523,19 @@ if user_input:
     if safe_mode:
         st.info("Safe mode ON — unfiltered, aggregated app list.")
         g = aggregate_app_level(df.copy())
-        # Guarantee default display columns exist
+        # Guarantee default display columns exist (NO Valid Ad Request)
         for _col, _default in [
-            ("Monthly Traffic", 0), ("Valid Ad Request", 0),
-            ("Ad Impressions Rendered", 0), ("Total Burn", 0.0), ("eCPM", 0.0),
+            ("Monthly Traffic", 0),
+            ("Ad Impressions Rendered", 0),
+            ("Total Burn", 0.0),
+            ("eCPM", 0.0),
         ]:
             if _col not in g.columns: g[_col] = _default
         if g.empty:
             st.error("Aggregation returned empty. Check APP_GROUP_KEYS columns exist.")
         else:
-            # Sort priority: Monthly Traffic (if present) → Valid Ad Request → Burn → Rendered
-            sort_cols = [c for c in ["Monthly Traffic","Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
+            # Sort priority: Monthly Traffic → Burn → Rendered
+            sort_cols = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g.columns]
             if sort_cols: g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
             show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
             st.dataframe(g[show_cols].head(500), use_container_width=True)
@@ -619,21 +595,22 @@ if user_input:
     # Aggregate
     g = aggregate_app_level(d)
 
-    # Guarantee default display columns exist
+    # Guarantee default display columns exist (NO Valid Ad Request)
     for _col, _default in [
-        ("Monthly Traffic", 0), ("Valid Ad Request", 0),
-        ("Ad Impressions Rendered", 0), ("Total Burn", 0.0), ("eCPM", 0.0),
+        ("Monthly Traffic", 0),
+        ("Ad Impressions Rendered", 0),
+        ("Total Burn", 0.0),
+        ("eCPM", 0.0),
     ]:
         if _col not in g.columns: g[_col] = _default
 
-    # thresholds (Monthly Traffic preferred; fallback to Valid Ad Request)
-    vol_col = "Monthly Traffic" if "Monthly Traffic" in g.columns else ("Valid Ad Request" if "Valid Ad Request" in g.columns else None)
-
+    # thresholds — Monthly Traffic only (as primary volume)
     st.sidebar.header("Thresholds (post-aggregation)")
     default_min_vol = q.get("thresholds", {}).get("min_requests", 0) or 0
-    # Premium hard minimums (apply to chosen volume column if present)
     if "premium" in (q.get("macros", []) or []) and not disable_premium_thresholds:
         default_min_vol = max(default_min_vol, 100_000)
+
+    vol_col = "Monthly Traffic" if "Monthly Traffic" in g.columns else None
     min_vol = st.sidebar.number_input(f"Min {vol_col or 'Volume'}", 0, 1_000_000_000, int(default_min_vol), 1000) if vol_col else 0
     min_rend = st.sidebar.number_input("Min Ad Impressions Rendered", 0, 1_000_000_000, int(q.get("thresholds", {}).get("min_rendered", 0) or 0), 1000)
     min_burn = st.sidebar.number_input("Min Total Burn ($)", 0.0, 1e12, float(q.get("thresholds", {}).get("min_burn", 0.0) or 0.0), 1.0)
@@ -642,8 +619,8 @@ if user_input:
     if "Ad Impressions Rendered" in g.columns and min_rend: g = g[g["Ad Impressions Rendered"] >= min_rend]
     if "Total Burn" in g.columns and min_burn: g = g[g["Total Burn"] >= min_burn]
 
-    # Sort — Monthly Traffic → Valid Ad Request → Burn → Rendered
-    sort_cols = [c for c in ["Monthly Traffic","Valid Ad Request","Total Burn","Ad Impressions Rendered"] if c in g.columns]
+    # Sort — Monthly Traffic → Burn → Rendered
+    sort_cols = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g.columns]
     if sort_cols:
         g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
 
