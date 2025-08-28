@@ -520,7 +520,7 @@ def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # UI
 # =========================
-st.title("Avails Bot — App-level List(Only NA & APAC for testing Purposes")
+st.title("Avails Bot — App-level List(Only NA & APAC for testing Purposes)")
 
 st.sidebar.header("Run options")
 safe_mode = st.sidebar.checkbox("Safe mode (ignore AI & thresholds)", value=False)
