@@ -114,6 +114,14 @@ COLUMN_ALIASES = {
     "valid_ad_request": "Valid Ad Request",
     "valid ad-requests": "Valid Ad Request",
     "valid ad_request": "Valid Ad Request",
+    "valid requests count": "Valid Ad Request",
+    "valid request count": "Valid Ad Request",
+    "valid reqs": "Valid Ad Request",
+    "valid requests_total": "Valid Ad Request",
+    "valid_request_count": "Valid Ad Request",
+    "valid_req_count": "Valid Ad Request",
+    "validadrequest": "Valid Ad Request",
+    "valid_ad_req_count": "Valid Ad Request",
 }
 
 COUNTRY_SYNONYMS = {
@@ -230,8 +238,13 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             continue
         lc = _lc(c)
 
-        # Valid Ad Request canonicalization
-        if re.search(r"\bvalid\b", lc) and re.search(r"\bad\b", lc) and re.search(r"\brequest", lc):
+        # Valid Ad Request canonicalization (aggressive)
+        # Matches: Valid Request(s), Valid Ad Request(s), Valid_Ad_Request_Count, Valid Req(s), etc.
+        if (
+            re.search(r"\bvalid\b", lc)
+            and re.search(r"\b(ad|ads)?\b", lc)
+            and re.search(r"\brequest(s)?\b|\breq(s)?\b|\brequest_count\b|\breq_count\b", lc)
+        ):
             if "Valid Ad Request" not in df.columns:
                 rename_map[c] = "Valid Ad Request"
                 continue
@@ -574,6 +587,12 @@ if user_input:
         if "Integration Method" in df.columns: st.write("Integration Method:", df["Integration Method"].value_counts(dropna=False))
         if "Country Name" in df.columns: st.write("Top countries:", df["Country Name"].value_counts(dropna=False).head(20))
 
+    # Immediate visibility if Valid Ad Request didn't normalize
+    if "Valid Ad Request" not in df.columns:
+        st.info("Heads-up: could not find **'Valid Ad Request'** in raw sheet after normalization. "
+                "We'll still display the column with zeros so your layout stays consistent. "
+                "Consider updating your Excel header or the normalizer.")
+
     required_for_group = ["Inmobi App Name","Forwarded Bundle ID","Operating System Name"]
     missing = [c for c in required_for_group if c not in df.columns]
     if missing:
@@ -582,6 +601,17 @@ if user_input:
     if safe_mode:
         st.info("Safe mode ON — unfiltered, aggregated app list.")
         g = aggregate_app_level(df.copy())
+
+        # --- SAFETY: guarantee display columns exist (so they always render) ---
+        for _col, _default in [
+            ("Valid Ad Request", 0),
+            ("Ad Impressions Rendered", 0),
+            ("Total Burn", 0.0),
+            ("eCPM", 0.0),
+        ]:
+            if _col not in g.columns:
+                g[_col] = _default
+
         if g.empty:
             st.error("Aggregation returned empty. Check APP_GROUP_KEYS columns exist.")
         else:
@@ -654,6 +684,23 @@ if user_input:
 
     # Aggregate (always returns Forwarded Bundle ID, OS, and Valid Ad Request in table)
     g = aggregate_app_level(d)
+
+    # --- SAFETY: guarantee display columns exist (so they always render) ---
+    for _col, _default in [
+        ("Valid Ad Request", 0),
+        ("Ad Impressions Rendered", 0),
+        ("Total Burn", 0.0),
+        ("eCPM", 0.0),
+    ]:
+        if _col not in g.columns:
+            g[_col] = _default
+
+    # Optional: warn if we had to synthesize 'Valid Ad Request'
+    base_g = aggregate_app_level(df.copy())
+    synthesized_valid = ("Valid Ad Request" in g.columns) and ("Valid Ad Request" not in base_g.columns)
+    if synthesized_valid:
+        st.info("‘Valid Ad Request’ wasn’t found in the raw data after normalization — showing 0s by default. "
+                "Update your Excel header or the normalizer to populate real values.")
 
     # thresholds (with premium hard minimums)
     thr = q.get("thresholds", {}) or {}
