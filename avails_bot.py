@@ -9,8 +9,10 @@ import openai
 # =========================
 # Config / Constants
 # =========================
-USE_LLM = True  # set False to force heuristic parser for every prompt
+# Toggle heuristic-only mode if LLM is flaky
+USE_LLM = True # set False to force heuristic parser for every prompt
 
+# Show a tiny banner so you know which mode you're in
 st.set_page_config(page_title="Avails Bot — Smart Filters", layout="wide")
 mode_badge = "LLM mode" if USE_LLM else "Heuristic mode"
 st.caption(f"🔧 Parser mode: **{mode_badge}**")
@@ -18,14 +20,14 @@ st.caption(f"🔧 Parser mode: **{mode_badge}**")
 # OpenAI client (expects OPENAI_API_KEY in Streamlit secrets)
 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# NOTE: No "Valid Ad Request" anywhere
+# --- NEW: `Monthly Traffic` instead of `Valid Ad Request` ---
 NUMERIC_HINTS = {
     "Monthly Traffic",
     "Ad Impressions Served",
     "Valid Wins",
     "Ad Impressions Rendered",
     "Total Burn",
-    "eCPM",  # ignored during group; recomputed later
+    "eCPM",
 }
 
 BOOL_LIKE_HINTS = {
@@ -48,7 +50,7 @@ POLICY_COLUMNS = {
     "KuCoin.com",
 }
 
-# natural aliases → real columns (no Valid Ad Request aliases)
+# --- NEW: Aliases updated to match new `Monthly Traffic` ---
 COLUMN_ALIASES = {
     # Country / OS
     "country": "Country Name",
@@ -82,6 +84,9 @@ COLUMN_ALIASES = {
     "inventory channel": "Inventory Channel",
     "device type": "Device Type Name",
     "device type name": "Device Type Name",
+    "monthly traffic": "Monthly Traffic", # NEW
+    "traffic": "Monthly Traffic", # NEW
+    "volume": "Monthly Traffic", # NEW
 
     # Policy shortcuts
     "gambling": "Gambling/Card Games",
@@ -104,7 +109,7 @@ COLUMN_ALIASES = {
     "green": "Certified as Green Media",
 }
 
-# Canon for country comparisons (lowercased)
+# Canonical values for country comparisons (lowercased)
 COUNTRY_CANON = {
     "usa": "united states",
     "us": "united states",
@@ -116,7 +121,7 @@ COUNTRY_CANON = {
     "united kingdom": "united kingdom",
 }
 
-COUNTRY_SYNONYMS = {  # kept for display/normalization
+COUNTRY_SYNONYMS = {
     "usa": "United States",
     "us": "United States",
     "u.s.": "United States",
@@ -124,7 +129,7 @@ COUNTRY_SYNONYMS = {  # kept for display/normalization
     "uk": "United Kingdom",
 }
 
-# App-level aggregation keys
+# App-level aggregation keys (bundle + OS included)
 APP_GROUP_KEYS = [
     "Publisher Account GUID",
     "Publisher Account Name",
@@ -136,28 +141,28 @@ APP_GROUP_KEYS = [
     "URL",
 ]
 
-# Display order
+# Display order (Volume added)
 DISPLAY_COLS_ORDER = [
-    "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
-    "Inmobi App Inc ID","Inmobi App Name",
-    "Forwarded Bundle ID","Operating System Name","URL",
-    "Monthly Traffic",
-    "Ad Impressions Rendered","Total Burn","eCPM",
+    "Publisher Account GUID", "Publisher Account Name", "Publisher Account Type",
+    "Inmobi App Inc ID", "Inmobi App Name",
+    "Forwarded Bundle ID", "Operating System Name", "URL",
+    "Monthly Traffic", "Ad Impressions Rendered", "Total Burn", "eCPM",
 ]
 
+# Lightweight synonyms for categories (fallback)
 CATEGORY_SYNONYMS = {
-    "cars": "Automotive","auto": "Automotive","automobile": "Automotive",
-    "beauty": "Beauty & Fitness","makeup": "Beauty & Fitness",
-    "finance": "Finance","fintech": "Finance",
-    "food": "Food & Drink","restaurants": "Food & Drink",
-    "travel": "Travel","education": "Education",
-    "health": "Health & Fitness","fitness": "Health & Fitness",
-    "parenting": "Parenting","kids": "Parenting",
-    "sports": "Sports","news": "News","shopping": "Shopping","ecommerce": "Shopping",
-    "entertainment": "Entertainment","music": "Music","video": "Video",
-    "productivity": "Productivity","business": "Business","lifestyle": "Lifestyle",
-    "photography": "Photography","art": "Arts & Design","weather": "Weather",
-    "maps": "Maps & Navigation","beauty & fitness": "Beauty & Fitness",
+    "cars": "Automotive", "auto": "Automotive", "automobile": "Automotive",
+    "beauty": "Beauty & Fitness", "makeup": "Beauty & Fitness",
+    "finance": "Finance", "fintech": "Finance",
+    "food": "Food & Drink", "restaurants": "Food & Drink",
+    "travel": "Travel", "education": "Education",
+    "health": "Health & Fitness", "fitness": "Health & Fitness",
+    "parenting": "Parenting", "kids": "Parenting",
+    "sports": "Sports", "news": "News", "shopping": "Shopping", "ecommerce": "Shopping",
+    "entertainment": "Entertainment", "music": "Music", "video": "Video",
+    "productivity": "Productivity", "business": "Business", "lifestyle": "Lifestyle",
+    "photography": "Photography", "art": "Arts & Design", "weather": "Weather",
+    "maps": "Maps & Navigation", "beauty & fitness": "Beauty & Fitness",
     "food & drink": "Food & Drink",
 }
 
@@ -168,7 +173,7 @@ def clean_app_name(s: str) -> str:
     if pd.isna(s): return s
     s = unicodedata.normalize("NFKC", str(s))
     s = "".join(ch for ch in s if ch.isprintable())
-    return re.sub(r"\s+"," ",s).strip()
+    return re.sub(r"\s+", " ", s).strip()
 
 def clean_header(h: Any) -> str:
     s = "" if h is None else str(h)
@@ -199,12 +204,12 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
 # ---- Canonicalize Vertical values everywhere ----
 def canonicalize_vertical_value(v: Any) -> Optional[str]:
     s = str(v or "").lower()
-    s = re.sub(r"[^a-z]+", " ", s)     # keep letters; others → spaces
+    s = re.sub(r"[^a-z]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     if not s: return None
     if s == "gaming": return "Gaming"
     if re.fullmatch(r"non\s*gaming", s): return "Non Gaming"
-    return None  # unknown stays as-is
+    return None
 
 def normalize_vertical_column(df: pd.DataFrame) -> pd.DataFrame:
     if "Vertical" in df.columns:
@@ -215,8 +220,8 @@ def normalize_vertical_column(df: pd.DataFrame) -> pd.DataFrame:
 
 def apply_final_format(df: pd.DataFrame) -> pd.DataFrame:
     def derive_final_format(row) -> str:
-        placement = str(row.get("Placement Type","")).strip().lower()
-        rewarded = str(row.get("Is Rewarded Slot","")).strip().lower() in {"true","1","yes"}
+        placement = str(row.get("Placement Type", "")).strip().lower()
+        rewarded = str(row.get("Is Rewarded Slot", "")).strip().lower() in {"true", "1", "yes"}
         if placement == "banner":
             return "Banner"
         elif placement == "interstitial":
@@ -285,8 +290,8 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def detect_region(prompt: str) -> str:
     p = (prompt or "").lower()
-    na_terms = ["us","usa","united states","canada","north america","na"]
-    apac_terms = ["india","indonesia","philippines","vietnam","apac","thailand","sg","singapore","malaysia"]
+    na_terms = ["us", "usa", "united states", "canada", "north america", "na"]
+    apac_terms = ["india", "indonesia", "philippines", "vietnam", "apac", "thailand", "sg", "singapore", "malaysia"]
     if any(t in p for t in na_terms): return "NA"
     if any(t in p for t in apac_terms): return "APAC"
     return "NA"
@@ -295,16 +300,14 @@ def detect_region(prompt: str) -> str:
 def load_df(region: str) -> pd.DataFrame:
     path = "na_avails.xlsx" if region == "NA" else "apac_avails.xlsx"
     df = pd.read_excel(path, engine="openpyxl")
-    df.columns = [clean_header(c) for c in df.columns]  # deep clean headers
+    df.columns = [clean_header(c) for c in df.columns]
     df = normalize_columns(df)
     if "Inmobi App Name" in df.columns:
         df["Inmobi App Name"] = df["Inmobi App Name"].apply(clean_app_name)
     df = apply_final_format(df)
     df = derive_vertical(df)
-    df = normalize_vertical_column(df)  # ensure canonical after derivation
-    # OPTIONAL: make country labels neat while keeping comparisons canonical
+    df = normalize_vertical_column(df)
     if "Country Name" in df.columns:
-        # keep original for display if you want; here we leave values as-is
         pass
     df = coerce_types(df)
     return df
@@ -331,10 +334,10 @@ def map_categories_with_llm(raw_terms: List[str], vocab: List[str]) -> List[str]
                    "user_terms": raw_terms, "CATEGORY_VOCAB": vocab[:400]}
         resp = client.chat.completions.create(
             model="gpt-4o",
-            messages=[{"role":"system","content":"Return only a JSON array or an object with key 'mapped'."},
-                      {"role":"user","content":json.dumps(payload)}],
+            messages=[{"role": "system", "content": "Return only a JSON array or an object with key 'mapped'."},
+                      {"role": "user", "content": json.dumps(payload)}],
             temperature=0.0,
-            response_format={"type":"json_object"},
+            response_format={"type": "json_object"},
         )
         raw = (resp.choices[0].message.content or "").strip()
         obj = json.loads(raw)
@@ -380,37 +383,37 @@ Guidance:
 - "SDK integration" => {"column":"Integration Method","op":"equals","value":"SDK"}.
 - "rewarded video" => final_format "Rewarded Video" and/or {"column":"Is Rewarded Slot","op":"is_true"}.
 - If the user says "gaming" or "non gaming", you MUST add {"column":"Vertical","op":"equals","value":"Gaming"/"Non Gaming"}.
-  Do NOT treat "gaming" only as a free-text category.
+- Do NOT treat "gaming" only as a free-text category.
 - If user says "premium"/"safe", add macro "premium".
 - If user says "green media", add macro "green".
 - "local apps" => macro "local_apps".
 - If user implies categories (e.g., "cars","fashion","fintech","education"), put them into categories_raw.
-  Categories_raw must be matched against "Inmobi App Categories" or "Primary Category" (NOT against Vertical).
+- Categories_raw must be matched against "Inmobi App Categories" or "Primary Category" (NOT against Vertical).
 Return compact JSON. No prose, no code fences.
 """
 
 def heuristic_query(prompt: str) -> Dict[str, Any]:
     p = (prompt or "").lower()
     out = {"filters": [], "macros": [], "thresholds": {}, "categories_raw": []}
-    if any(k in p for k in ["usa","us","united states"]):
-        out["filters"].append({"column":"Country Name","op":"equals","value":"United States"})
-    if "india" in p: out["filters"].append({"column":"Country Name","op":"equals","value":"India"})
-    if "android" in p: out["filters"].append({"column":"Operating System Name","op":"equals","value":"Android"})
-    if "ios" in p or "iphone" in p: out["filters"].append({"column":"Operating System Name","op":"equals","value":"iOS"})
-    if "sdk" in p: out["filters"].append({"column":"Integration Method","op":"equals","value":"SDK"})
-    if "rewarded" in p: out["filters"].append({"column":"Is Rewarded Slot","op":"is_true"})
-    if "banner" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Banner"})
-    if "interstitial" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
-    if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
-    if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
+    if any(k in p for k in ["usa", "us", "united states"]):
+        out["filters"].append({"column": "Country Name", "op": "equals", "value": "United States"})
+    if "india" in p: out["filters"].append({"column": "Country Name", "op": "equals", "value": "India"})
+    if "android" in p: out["filters"].append({"column": "Operating System Name", "op": "equals", "value": "Android"})
+    if "ios" in p or "iphone" in p: out["filters"].append({"column": "Operating System Name", "op": "equals", "value": "iOS"})
+    if "sdk" in p: out["filters"].append({"column": "Integration Method", "op": "equals", "value": "SDK"})
+    if "rewarded" in p: out["filters"].append({"column": "Is Rewarded Slot", "op": "is_true"})
+    if "banner" in p: out["filters"].append({"column": "Final Format", "op": "equals", "value": "Banner"})
+    if "interstitial" in p or "fsi" in p: out["filters"].append({"column": "Final Format", "op": "equals", "value": "FSI"})
+    if "native" in p: out["filters"].append({"column": "Final Format", "op": "equals", "value": "Native"})
+    if "video" in p and "rewarded" not in p: out["filters"].append({"column": "Final Format", "op": "equals", "value": "API Video"})
     if re.search(r"\bnon[-_\s]?gaming\b", p):
-        out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
+        out["filters"].append({"column": "Vertical", "op": "equals", "value": "Non Gaming"})
     elif re.search(r"\bgaming\b", p):
-        out["filters"].append({"column":"Vertical","op":"equals","value":"Gaming"})
+        out["filters"].append({"column": "Vertical", "op": "equals", "value": "Gaming"})
     if "premium" in p or "safe" in p: out["macros"].append("premium")
     if "green" in p: out["macros"].append("green")
     if "local" in p: out["macros"].append("local_apps")
-    for k in ["cars","auto","beauty","finance","fintech","food","travel","education","health","fitness","parenting","sports","news","shopping","entertainment","music","video","business","lifestyle"]:
+    for k in ["cars", "auto", "beauty", "finance", "fintech", "food", "travel", "education", "health", "fitness", "parenting", "sports", "news", "shopping", "entertainment", "music", "video", "business", "lifestyle"]:
         if k in p: out["categories_raw"].append(k)
     return out
 
@@ -447,15 +450,17 @@ def alias_to_canonical(col: str) -> str:
 
 def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) -> pd.DataFrame:
     col = alias_to_canonical(column)
-    if col not in df.columns:
-        return df
-
-    # Canonicalize expected value for Vertical comparisons
+    if col not in df.columns: return df
+    
+    # --- NEW: Improved logic for Vertical & Country Name canonicalization ---
     if col == "Vertical" and op == "equals":
         v_can = canonicalize_vertical_value(value)
-        if v_can:
-            value = v_can
+        if v_can: value = v_can
 
+    if col == "Country Name" and op == "equals":
+        value_norm = canonicalize_country_value(value)
+        
+    # --- Macro-style policy filters ---
     if op in {"allowed", "blocked"} and col in POLICY_COLUMNS:
         s = df[col].astype(str).str.lower()
         truthy = s.str.contains("allow|allowed|yes|true|1|clean", na=False)
@@ -467,30 +472,27 @@ def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) 
     if op == "equals":
         if pd.api.types.is_numeric_dtype(df[col]):
             return df[df[col] == pd.to_numeric(value, errors="coerce")]
-
-        # Special: normalize Vertical & Country Name comparisons
+        
         if col == "Vertical":
             series_norm = df[col].map(canonicalize_vertical_value).fillna(series)
             return df[series_norm.str.casefold() == str(value).casefold()]
-
+        
         if col == "Country Name":
             series_norm = df[col].apply(canonicalize_country_value)
-            value_norm = canonicalize_country_value(value)
             return df[series_norm == value_norm]
 
-        # default string equals
         return df[series.str.casefold() == str(value).casefold()]
 
     if op == "contains":
         return df[series.str.contains(str(value), case=False, na=False)]
 
-    if op in {"in","not_in"}:
+    if op in {"in", "not_in"}:
         vals = value if isinstance(value, list) else [value]
         vals_lc = set(str(v).casefold() for v in vals)
         mask = series.str.casefold().isin(vals_lc)
         return df[mask] if op == "in" else df[~mask]
 
-    if op in {"gte","lte","gt","lt"}:
+    if op in {"gte", "lte", "gt", "lt"}:
         s = pd.to_numeric(df[col], errors="coerce")
         v = pd.to_numeric(value, errors="coerce")
         if pd.isna(v): return df
@@ -503,6 +505,7 @@ def apply_one_filter(df: pd.DataFrame, column: str, op: str, value: Any = None) 
         return df[series.str.contains("true|1|yes", case=False, na=False)]
     if op == "is_false":
         return df[~series.str.contains("true|1|yes", case=False, na=False)]
+    
     return df
 
 def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
@@ -524,12 +527,12 @@ def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
             d = d[s.isin(CLEAN_CANON)]
         if "Inmobi App Name" in d.columns:
             def ok(s):
-                if not isinstance(s,str) or not s: return False
+                if not isinstance(s, str) or not s: return False
                 bad = sum(1 for ch in s if not ch.isalnum() and ch not in " ._-&()")
-                return bad / max(1,len(s)) <= 0.3
+                return bad / max(1, len(s)) <= 0.3
             d = d[d["Inmobi App Name"].apply(ok)]
     if "green" in macros:
-        green_cols = ["Certified as Green Media","Scope3","Scope 3","Scope3 Certified","Scope 3 Certified"]
+        green_cols = ["Certified as Green Media", "Scope3", "Scope 3", "Scope3 Certified", "Scope 3 Certified"]
         any_mask = None
         for gc in green_cols:
             if gc in d.columns:
@@ -538,18 +541,14 @@ def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
                 any_mask = m if any_mask is None else (any_mask | m)
         if any_mask is not None:
             d = d[any_mask]
-    if "local_apps" in macros and {"Publisher Origin Country Name","Country Name"} <= set(d.columns):
+    if "local_apps" in macros and {"Publisher Origin Country Name", "Country Name"} <= set(d.columns):
         d = d[d["Publisher Origin Country Name"].astype(str).str.lower() == d["Country Name"].astype(str).str.lower()]
     return d
 
 def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
     group_cols = [c for c in APP_GROUP_KEYS if c in df.columns]
-    if not group_cols:
-        return pd.DataFrame()
-    agg = {}
-    for c in NUMERIC_HINTS:
-        if c in df.columns and c != "eCPM":
-            agg[c] = "sum"
+    if not group_cols: return pd.DataFrame()
+    agg = {c: "sum" for c in NUMERIC_HINTS if c in df.columns and c != "eCPM"}
     g = df.groupby(group_cols, dropna=False).agg(agg).reset_index()
     if "Total Burn" in g.columns and "Ad Impressions Rendered" in g.columns:
         denom = g["Ad Impressions Rendered"].replace(0, pd.NA)
@@ -557,13 +556,12 @@ def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 # =========================
-# UI
+# Streamlit UI for testing
 # =========================
 st.title("Avails Bot — App-level List (Smart, Schema-Aware)")
 
 st.sidebar.header("Run options")
 safe_mode = st.sidebar.checkbox("Safe mode (ignore AI & thresholds)", value=False)
-disable_premium_thresholds = st.sidebar.checkbox("Disable premium thresholds", value=False)
 if st.sidebar.button("🔁 Clear cached data"):
     st.cache_data.clear()
     st.experimental_rerun()
@@ -581,11 +579,11 @@ if user_input:
         if "Country Name" in df.columns: st.write("Top countries:", df["Country Name"].value_counts(dropna=False).head(20))
         if "Vertical" in df.columns: st.write("Vertical (raw/canonical):", df["Vertical"].value_counts(dropna=False))
 
-    required_for_group = ["Inmobi App Name","Forwarded Bundle ID","Operating System Name"]
+    required_for_group = ["Inmobi App Name", "Forwarded Bundle ID", "Operating System Name"]
     missing = [c for c in required_for_group if c not in df.columns]
     if missing:
         st.error(f"Missing required columns for grouping: {missing}. Check your Excel headers or update COLUMN_ALIASES.")
-
+    
     if safe_mode:
         st.info("Safe mode ON — unfiltered, aggregated app list.")
         g = aggregate_app_level(df.copy())
@@ -599,8 +597,8 @@ if user_input:
         if g.empty:
             st.error("Aggregation returned empty. Check APP_GROUP_KEYS columns exist.")
         else:
-            sort_cols = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g.columns]
-            if sort_cols: g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
+            sort_cols = [c for c in ["Monthly Traffic", "Total Burn", "Ad Impressions Rendered"] if c in g.columns]
+            if sort_cols: g = g.sort_values(sort_cols, ascending=[False] * len(sort_cols))
             show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
             st.dataframe(g[show_cols].head(500), use_container_width=True)
             st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
@@ -613,18 +611,16 @@ if user_input:
     # --- HARD ENFORCEMENT: derive the Vertical filter directly from user text ---
     text_lc = (user_input or "").lower()
     def ensure_vertical_filter(qobj, text):
-        # remove any existing Vertical filters first (avoid duplicates / contradictions)
-        qobj["filters"] = [f for f in (qobj.get("filters") or []) if f.get("column","").strip().lower() != "vertical"]
+        qobj["filters"] = [f for f in (qobj.get("filters") or []) if f.get("column", "").strip().lower() != "vertical"]
         if re.search(r"\bnon[-_\s]?gaming\b", text):
-            qobj.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Non Gaming"})
+            qobj.setdefault("filters", []).append({"column": "Vertical", "op": "equals", "value": "Non Gaming"})
         elif re.search(r"\bgaming\b", text):
-            qobj.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Gaming"})
+            qobj.setdefault("filters", []).append({"column": "Vertical", "op": "equals", "value": "Gaming"})
         return qobj
     q = ensure_vertical_filter(q, text_lc)
     # ---------------------------------------------------------------------------
-
-    with st.expander("Parsed query (debug)"):
-        st.json(q)
+    
+    with st.expander("Parsed query (debug)"): st.json(q)
     with st.expander("LLM errors & raw (if any)"):
         if parse_info.get("request_id"): st.write(f"request_id: {parse_info['request_id']}")
         if parse_info.get("error"): st.error(parse_info["error"])
@@ -636,7 +632,7 @@ if user_input:
     d = normalize_vertical_column(d)
     for filt in q.get("filters", []):
         if (filt.get("column") or "").strip().lower() == "vertical" and "Vertical" in d.columns:
-            d = apply_one_filter(d, "Vertical", filt.get("op","equals"), filt.get("value"))
+            d = apply_one_filter(d, "Vertical", filt.get("op", "equals"), filt.get("value"))
 
     # final_format if present (robust rewarded handling)
     ff = q.get("final_format")
@@ -655,7 +651,6 @@ if user_input:
         if col.lower() == "vertical": continue
         op = filt.get("op"); val = filt.get("value")
         if alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
-            # don't transform display; canonicalize only for compare inside apply_one_filter
             pass
         d = apply_one_filter(d, col or "", op or "equals", val)
 
@@ -696,7 +691,6 @@ if user_input:
     # thresholds — NO hidden premium floor
     st.sidebar.header("Thresholds (post-aggregation)")
     default_min_vol = q.get("thresholds", {}).get("min_requests", 0) or 0
-
     vol_col = "Monthly Traffic" if "Monthly Traffic" in g.columns else None
     min_vol = st.sidebar.number_input(f"Min {vol_col or 'Volume'}", 0, 1_000_000_000, int(default_min_vol), 1000) if vol_col else 0
     min_rend = st.sidebar.number_input("Min Ad Impressions Rendered", 0, 1_000_000_000, int(q.get("thresholds", {}).get("min_rendered", 0) or 0), 1000)
@@ -705,68 +699,58 @@ if user_input:
     if vol_col and min_vol: g = g[g[vol_col] >= min_vol]
     if "Ad Impressions Rendered" in g.columns and min_rend: g = g[g["Ad Impressions Rendered"] >= min_rend]
     if "Total Burn" in g.columns and min_burn: g = g[g["Total Burn"] >= min_burn]
-
+    
     # Sort — Monthly Traffic → Burn → Rendered
-    sort_cols = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g.columns]
-    if sort_cols:
-        g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
+    sort_cols = [c for c in ["Monthly Traffic", "Total Burn", "Ad Impressions Rendered"] if c in g.columns]
+    if sort_cols: g = g.sort_values(sort_cols, ascending=[False] * len(sort_cols))
 
     # Graceful fallbacks if empty
     if g.empty:
-        # 1) Drop thresholds only
         d_no_thresh = d.copy()
         g_no_thresh = aggregate_app_level(d_no_thresh)
-        for _col, _default in [("Monthly Traffic",0),("Ad Impressions Rendered",0),("Total Burn",0.0),("eCPM",0.0)]:
+        for _col, _default in [("Monthly Traffic", 0), ("Ad Impressions Rendered", 0), ("Total Burn", 0.0), ("eCPM", 0.0)]:
             if _col not in g_no_thresh.columns: g_no_thresh[_col] = _default
         if not g_no_thresh.empty:
             st.info("No rows met your thresholds. Showing results with the same filters but **without thresholds**.")
-            sort_cols2 = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g_no_thresh.columns]
-            if sort_cols2: g_no_thresh = g_no_thresh.sort_values(sort_cols2, ascending=[False]*len(sort_cols2))
+            sort_cols2 = [c for c in ["Monthly Traffic", "Total Burn", "Ad Impressions Rendered"] if c in g_no_thresh.columns]
+            if sort_cols2: g_no_thresh = g_no_thresh.sort_values(sort_cols2, ascending=[False] * len(sort_cols2))
             show_cols2 = [c for c in DISPLAY_COLS_ORDER if c in g_no_thresh.columns]
             st.dataframe(g_no_thresh[show_cols2].head(500), use_container_width=True)
             st.download_button("Download CSV (no thresholds)", g_no_thresh.to_csv(index=False).encode("utf-8"), "avails_no_thresholds.csv", "text/csv")
             st.stop()
-
-        # 2) If strict Rewarded was requested, relax to rewarded slot
+        
         if ff == "Rewarded Video" and "Final Format" in df.columns:
             d_relaxed = df.copy()
             d_relaxed = normalize_vertical_column(d_relaxed)
-            # Re-apply Vertical
             for filt in q.get("filters", []):
                 if (filt.get("column") or "").strip().lower() == "vertical":
-                    d_relaxed = apply_one_filter(d_relaxed, "Vertical", filt.get("op","equals"), filt.get("value"))
-            # Re-apply other filters except Final Format
+                    d_relaxed = apply_one_filter(d_relaxed, "Vertical", filt.get("op", "equals"), filt.get("value"))
             for filt in q.get("filters", []):
                 col = (filt.get("column") or "").strip().lower()
-                if col in {"vertical","final format"}: 
+                if col in {"vertical", "final format"}:
                     continue
                 d_relaxed = apply_one_filter(d_relaxed, filt.get("column") or "", filt.get("op") or "equals", filt.get("value"))
-            # Keep rewarded by slot flag
             if "Is Rewarded Slot" in d_relaxed.columns:
                 d_relaxed = d_relaxed[d_relaxed["Is Rewarded Slot"].astype(str).str.contains("true|1|yes", case=False, na=False)]
             d_relaxed = apply_macros(d_relaxed, q.get("macros", []))
             g_relaxed = aggregate_app_level(d_relaxed)
-            for _col, _default in [("Monthly Traffic",0),("Ad Impressions Rendered",0),("Total Burn",0.0),("eCPM",0.0)]:
+            for _col, _default in [("Monthly Traffic", 0), ("Ad Impressions Rendered", 0), ("Total Burn", 0.0), ("eCPM", 0.0)]:
                 if _col not in g_relaxed.columns: g_relaxed[_col] = _default
             if not g_relaxed.empty:
                 st.info("No rows with strict 'Rewarded Video'. Showing **rewarded slots** (relaxed) with your other filters.")
-                sort_cols3 = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g_relaxed.columns]
-                if sort_cols3: g_relaxed = g_relaxed.sort_values(sort_cols3, ascending=[False]*len(sort_cols3))
+                sort_cols3 = [c for c in ["Monthly Traffic", "Total Burn", "Ad Impressions Rendered"] if c in g_relaxed.columns]
+                if sort_cols3: g_relaxed = g_relaxed.sort_values(sort_cols3, ascending=[False] * len(sort_cols3))
                 show_cols3 = [c for c in DISPLAY_COLS_ORDER if c in g_relaxed.columns]
                 st.dataframe(g_relaxed[show_cols3].head(500), use_container_width=True)
                 st.download_button("Download CSV (rewarded relaxed)", g_relaxed.to_csv(index=False).encode("utf-8"), "avails_rewarded_relaxed.csv", "text/csv")
                 st.stop()
-
         st.warning("No results. Try lowering thresholds or removing 'rewarded'/'premium'.")
         st.stop()
-
-    if g.empty:
-        st.warning("No results. Loosen filters or thresholds.")
     else:
         show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
         st.success(f"Apps matched: {len(g)}")
         st.dataframe(g[show_cols].head(500), use_container_width=True)
         st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
-
+        
     with st.expander("Available columns in dataset"):
         st.write(sorted(df.columns.tolist()))
