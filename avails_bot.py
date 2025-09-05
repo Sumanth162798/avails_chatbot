@@ -1,4 +1,4 @@
-# avails_bot.py — Smart vertical truth, Jounce fixed, video-supply override, sums-after-filters, intents
+# avails_bot.py — Include parsing + passthrough columns, smart vertical truth, Jounce fixed, video-supply override, sums-after-filters, intents
 import os, json, re, unicodedata, difflib, traceback
 from typing import List, Optional, Any, Dict, Set
 
@@ -47,6 +47,9 @@ COLUMN_ALIASES = {
     # Categories
     "category":"Primary Category","primary category":"Primary Category","vertical":"Vertical","iab":"Primary Category",
     "url":"URL","jounce":"Jounce Media","green":"Certified as Green Media",
+    # Extra aliases for includes
+    "jounce score": "Jounce Media",
+    "jounce rating": "Jounce Media",
 }
 
 COUNTRY_CANON = {
@@ -93,8 +96,30 @@ CATEGORY_SYNONYMS = {
 GAMEY_PAT = re.compile(r"\bgame(s|r)?\b|\bgaming\b", re.I)
 NON_GAMING_PAT = re.compile(r"\bnon[-_\s]*gaming\b", re.I)
 VIDEO_SUPPLY_PAT = re.compile(r"\bvideo\s+supply\b|\bvideo\b.*\bsupply\b", re.I)
+INCLUDE_ANCHOR_PAT = re.compile(r"(?:with|including|along with|also show|show)\s+(.*)$", re.I)
 
 # ========= Helpers =========
+def parse_include_columns(prompt: str) -> list:
+    """
+    Extract column-like phrases after 'with/including/along with/also show/show ...'
+    Supports comma-separated and 'and' joined lists.
+    """
+    if not prompt:
+        return []
+    m = INCLUDE_ANCHOR_PAT.search(prompt)
+    if not m:
+        return []
+    tail = m.group(1)
+    tail = re.sub(r"[.?!]+$", "", tail.strip())
+    parts = re.split(r",", tail)
+    tokens = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        tokens.extend([t.strip() for t in re.split(r"\band\b", p, flags=re.I) if t.strip()])
+    return [re.sub(r"\s+", " ", t).lower() for t in tokens]
+
 def clean_app_name(s: str) -> str:
     if pd.isna(s): return s
     s = unicodedata.normalize("NFKC", str(s))
@@ -349,13 +374,16 @@ def heuristic_query(prompt: str) -> Dict[str, Any]:
     if "premium" in p or "safe" in p: out["macros"].append("premium")
     if "green" in p: out["macros"].append("green")
     if "local" in p: out["macros"].append("local_apps")
+
     for k in CATEGORY_SYNONYMS.keys():
         if k in p: out["categories_raw"].append(k)
+
     if COUNT_PAT.search(p): out["intent"] = "count"
     if BREAKDOWN_PAT.search(p): out["intent"] = "breakdown"
     if SUMMARY_PAT.search(p): out["intent"] = "summary"
-    inc = re.findall(r"(?:with|including|along with|also show|show)\s+([a-z0-9 _/&-]+)", p)
-    out["include_cols"] = [x.strip() for x in inc]
+
+    # improved include parsing
+    out["include_cols"] = parse_include_columns(prompt)
     return out
 
 def extract_query_with_errors(prompt: str) -> Dict[str, Any]:
@@ -482,19 +510,31 @@ def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
 
     return d
 
-def aggregate_app_level(df: pd.DataFrame, grain: str = DEFAULT_GROUP_GRAIN) -> pd.DataFrame:
+def aggregate_app_level(df: pd.DataFrame, grain: str = DEFAULT_GROUP_GRAIN, passthrough_cols: list = None) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     group_cols = APP_KEYS_APP_OS if grain == "app_os" else APP_KEYS_APP_ONLY
     group_cols = [c for c in group_cols if c in df.columns]
+
     if not group_cols:
         return pd.DataFrame()
+
+    # Build aggregation map
     agg_map = {c: "sum" for c in AGG_SUM_COLS if c in df.columns}
+
+    # carry through requested non-numeric columns (if present and not already a group key)
+    passthrough_cols = passthrough_cols or []
+    for c in passthrough_cols:
+        if c in df.columns and c not in group_cols and c not in agg_map:
+            agg_map[c] = "first"  # stable representative
+
     g = (df.groupby(group_cols, dropna=False).agg(agg_map).reset_index())
+
     # eCPM from aggregated sums (hidden unless user asks)
     if {"Total Burn","Ad Impressions Rendered"} <= set(g.columns):
         denom = g["Ad Impressions Rendered"].replace(0, pd.NA)
         g["eCPM"] = (g["Total Burn"] * 1000.0) / denom
+
     return g
 
 def normalize_include_cols(include_cols: List[str], df: pd.DataFrame) -> List[str]:
@@ -598,7 +638,9 @@ if user_input:
 
     if safe_mode:
         st.info("Safe mode ON — unfiltered, aggregated app list.")
-        g = aggregate_app_level(df.copy(), grain=grain)
+        # Determine requested includes now (in DF space) for passthrough
+        requested_includes_dfspace = normalize_include_cols(parse_include_columns(user_input), df)
+        g = aggregate_app_level(df.copy(), grain=grain, passthrough_cols=requested_includes_dfspace)
         for _col, _default in [("Monthly Traffic",0),("Ad Impressions Rendered",0),("Total Burn",0.0)]:
             if _col not in g.columns: g[_col] = _default
         if g.empty:
@@ -607,7 +649,9 @@ if user_input:
             sort_cols = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g.columns]
             if sort_cols: g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
             base_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
-            st.dataframe(g[base_cols].head(500), use_container_width=True)
+            include_cols = normalize_include_cols(parse_include_columns(user_input), g)
+            show_cols = base_cols + [c for c in include_cols if c not in base_cols and c in g.columns]
+            st.dataframe(g[show_cols].head(500), use_container_width=True)
             st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
         st.stop()
 
@@ -708,9 +752,12 @@ if user_input:
     d = apply_macros(d, q.get("macros", []))
     d = _dbg_count("after macros (premium/green/local)", d)
 
-    # Aggregate (SUMS)
+    # Determine requested includes in DF space (so we can carry them through aggregation)
+    requested_includes_dfspace = normalize_include_cols(q.get("include_cols", []), df)
+
+    # Aggregate (SUMS) with passthrough columns
     d = _dbg_count("before aggregation", d)
-    g = aggregate_app_level(d, grain=grain)
+    g = aggregate_app_level(d, grain=grain, passthrough_cols=requested_includes_dfspace)
     st.session_state["_debug_counts"].append(("after aggregation (groups)", len(g)))
 
     # Ensure defaults present
