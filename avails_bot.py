@@ -572,7 +572,7 @@ rewarded_mode = st.sidebar.selectbox(
 if st.sidebar.button("🔁 Clear cached data"):
     st.cache_data.clear(); st.experimental_rerun()
 
-user_input = st.text_input("Ask e.g. 'Game apps in India' or 'Video supply in Canada' or 'Premium rewarded gaming apps in US on SDK, Android; include Primary Category'")
+user_input = st.text_input("Ask your question here")
 
 # Debug collector
 def _dbg_count(label: str, d: pd.DataFrame):
@@ -763,11 +763,8 @@ if user_input:
         st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
         st.stop()
 
-    # Include extra columns on demand (incl. eCPM if explicitly asked)
+    # Include extra columns on demand (all fuzzy-mapped; no special-casing)
     include_cols = normalize_include_cols(q.get("include_cols", []), g)
-    if any(re.search(r"\becpm\b", str(x), re.I) for x in q.get("include_cols", [])):
-        if "eCPM" not in include_cols and "eCPM" in g.columns:
-            include_cols.append("eCPM")
 
     # Render table
     base_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
