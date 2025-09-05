@@ -1,4 +1,4 @@
-# avails_bot.py — Smart vertical (game/games), Vertical_Truth, Jounce fixed, sums-after-filters, intents
+# avails_bot.py — Smart vertical truth, Jounce fixed, video-supply override, sums-after-filters, intents
 import os, json, re, unicodedata, difflib, traceback
 from typing import List, Optional, Any, Dict, Set
 
@@ -8,7 +8,7 @@ import openai
 
 # ========= Config =========
 USE_LLM = True  # set False to force heuristic parser for every prompt
-st.set_page_config(page_title="Avails Bot — Smart Filters", layout="wide")
+st.set_page_config(page_title="Avails Bot (Beta Testing version)", layout="wide")
 st.caption(f"🔧 Parser mode: **{'LLM mode' if USE_LLM else 'Heuristic mode'}**")
 
 # OpenAI client (expects OPENAI_API_KEY in Streamlit secrets)
@@ -89,9 +89,10 @@ CATEGORY_SYNONYMS = {
     "beauty & fitness":"Beauty & Fitness","food & drink":"Food & Drink",
 }
 
-# ========= Regex for vertical from text =========
+# ========= Regex cues =========
 GAMEY_PAT = re.compile(r"\bgame(s|r)?\b|\bgaming\b", re.I)
 NON_GAMING_PAT = re.compile(r"\bnon[-_\s]*gaming\b", re.I)
+VIDEO_SUPPLY_PAT = re.compile(r"\bvideo\s+supply\b|\bvideo\b.*\bsupply\b", re.I)
 
 # ========= Helpers =========
 def clean_app_name(s: str) -> str:
@@ -227,7 +228,7 @@ def load_df(region: str) -> pd.DataFrame:
         df = derive_vertical(df)
         df = normalize_vertical_column(df)
         df = coerce_types(df)
-        df = compute_vertical_truth(df)  # << key: compute Vertical_Truth at load
+        df = compute_vertical_truth(df)  # Vertical_Truth at load
         frames.append(df)
     if not frames:
         return pd.DataFrame()
@@ -335,9 +336,12 @@ def heuristic_query(prompt: str) -> Dict[str, Any]:
     if "sdk" in p: out["filters"].append({"column":"Integration Method","op":"equals","value":"SDK"})
     if "rewarded" in p: out["filters"].append({"column":"Is Rewarded Slot","op":"is_true"})
     if "banner" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Banner"})
-    if "interstitial" in p or "fullscreen" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
+    if "interstitial" in p or "fullscreen" in p or "fsi" in p:
+        out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
     if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
-    if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
+    if "video" in p and "rewarded" not in p:
+        # legacy heuristic; will be overridden by video supply override if "video supply" is asked
+        out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
     if NON_GAMING_PAT.search(p):
         out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
     elif GAMEY_PAT.search(p):
@@ -555,7 +559,7 @@ def answer_summary(g: pd.DataFrame):
         st.dataframe(small[keep], use_container_width=True)
 
 # ========= UI =========
-st.title("Avails Bot — App-level (Filters → Sums → Answers)")
+st.title("Avails Bot (Beta Testing version)")
 
 st.sidebar.header("Run options")
 safe_mode = st.sidebar.checkbox("Safe mode (ignore AI & thresholds)", value=False)
@@ -568,7 +572,7 @@ rewarded_mode = st.sidebar.selectbox(
 if st.sidebar.button("🔁 Clear cached data"):
     st.cache_data.clear(); st.experimental_rerun()
 
-user_input = st.text_input("Ask e.g. 'Game apps in India' or 'Premium rewarded gaming apps in United States on SDK, Android; include Primary Category'")
+user_input = st.text_input("Ask e.g. 'Game apps in India' or 'Video supply in Canada' or 'Premium rewarded gaming apps in US on SDK, Android; include Primary Category'")
 
 # Debug collector
 def _dbg_count(label: str, d: pd.DataFrame):
@@ -631,7 +635,16 @@ if user_input:
         if not any((f.get("column","").strip().lower()=="is rewarded slot") for f in fs):
             fs.append({"column":"Is Rewarded Slot","op":"is_true"})
         q["filters"] = fs
-    # ------------------------------
+
+    # --- Video supply override (Placement Type = Interstitial or Video) ---
+    video_supply_mode = False
+    t_lower = (user_input or "").lower()
+    if VIDEO_SUPPLY_PAT.search(user_input or "") and not re.search(r"\brewarded\b", t_lower):
+        video_supply_mode = True
+        # remove any Final Format filter the parser/heuristics might have added
+        q["filters"] = [f for f in (q.get("filters") or []) if (f.get("column","").strip().lower() != "final format")]
+        # add Placement Type IN {Interstitial, Video}
+        q["filters"].append({"column": "Placement Type", "op": "in", "value": ["Interstitial","Video"]})
 
     with st.expander("Parsed query (debug)"):
         st.json(q)
@@ -648,7 +661,6 @@ if user_input:
     for filt in q.get("filters", []):
         if (filt.get("column") or "").strip().lower() == "vertical":
             val = filt.get("value")
-            # Force use of Vertical_Truth
             d = d[d["Vertical_Truth"].astype(str).str.casefold() == str(val).casefold()]
     d = _dbg_count("after vertical (truth)", d)
 
@@ -730,14 +742,23 @@ if user_input:
     # Intent handling
     intent = detect_intent(user_input, q)
     if intent == "count":
+        if video_supply_mode:
+            st.info("Note: 65% of request ad slots for **FSI** inventory on exchange are **video-ready** (based on the requested ad format). "
+                    "Normalization on this basis is applied today; an exact breakdown is coming in the next versions.")
         answer_count(g)
         st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
         st.stop()
     if intent == "breakdown":
+        if video_supply_mode:
+            st.info("Note: 65% of request ad slots for **FSI** inventory on exchange are **video-ready** (based on the requested ad format). "
+                    "Normalization on this basis is applied today; an exact breakdown is coming in the next versions.")
         answer_breakdown(g)
         st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
         st.stop()
     if intent == "summary":
+        if video_supply_mode:
+            st.info("Note: 65% of request ad slots for **FSI** inventory on exchange are **video-ready** (based on the requested ad format). "
+                    "Normalization on this basis is applied today; an exact breakdown is coming in the next versions.")
         answer_summary(g)
         st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
         st.stop()
@@ -752,6 +773,9 @@ if user_input:
     base_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
     show_cols = base_cols + [c for c in include_cols if c not in base_cols and c in g.columns]
     st.success(f"Apps matched: {len(g)}")
+    if video_supply_mode:
+        st.info("Note: 65% of request ad slots for **FSI** inventory on exchange are **video-ready** (based on the requested ad format). "
+                "Normalization on this basis is applied today; an exact breakdown is coming in the next versions.")
     st.dataframe(g[show_cols].head(500), use_container_width=True)
     st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
 
