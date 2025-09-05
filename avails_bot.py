@@ -19,13 +19,14 @@ st.caption(f"🔧 Parser mode: **{mode_badge}**")
 client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # NOTE: No "Valid Ad Request" anywhere
+# (Removed eCPM from NUMERIC_HINTS so it's not a "necessary" column.)
 NUMERIC_HINTS = {
     "Monthly Traffic",
     "Ad Impressions Served",
     "Valid Wins",
     "Ad Impressions Rendered",
     "Total Burn",
-    "eCPM",  # ignored during group; recomputed later
+    # "eCPM",  # ← no longer treated as a base/numeric hint
 }
 
 BOOL_LIKE_HINTS = {
@@ -136,13 +137,14 @@ APP_GROUP_KEYS = [
     "URL",
 ]
 
-# Display order
+# Default display order (Removed eCPM from default.)
 DISPLAY_COLS_ORDER = [
     "Publisher Account GUID","Publisher Account Name","Publisher Account Type",
     "Inmobi App Inc ID","Inmobi App Name",
     "Forwarded Bundle ID","Operating System Name","URL",
     "Monthly Traffic",
-    "Ad Impressions Rendered","Total Burn","eCPM",
+    "Ad Impressions Rendered","Total Burn",
+    # "eCPM",  # not by default; included only if asked
 ]
 
 CATEGORY_SYNONYMS = {
@@ -302,10 +304,6 @@ def load_df(region: str) -> pd.DataFrame:
     df = apply_final_format(df)
     df = derive_vertical(df)
     df = normalize_vertical_column(df)  # ensure canonical after derivation
-    # OPTIONAL: make country labels neat while keeping comparisons canonical
-    if "Country Name" in df.columns:
-        # keep original for display if you want; here we leave values as-is
-        pass
     df = coerce_types(df)
     return df
 
@@ -375,6 +373,8 @@ Return ONLY a JSON object with keys:
 - thresholds: optional {"min_requests": int, "min_rendered": int, "min_burn": number}
 - final_format: optional in ["Banner","FSI","Native","Rewarded Video","API Video"]
 - categories_raw: optional array of user category terms (e.g., ["cars","beauty","fintech"])
+- include_cols: optional array of column names to include in the final display (e.g., ["Primary Category","Vertical","URL"])
+- intent: optional in ["list","count"]; set "count" when the user asks "how many" or "count"
 Guidance:
 - "USA"/"US" => "United States" for column "Country Name".
 - "SDK integration" => {"column":"Integration Method","op":"equals","value":"SDK"}.
@@ -391,7 +391,7 @@ Return compact JSON. No prose, no code fences.
 
 def heuristic_query(prompt: str) -> Dict[str, Any]:
     p = (prompt or "").lower()
-    out = {"filters": [], "macros": [], "thresholds": {}, "categories_raw": []}
+    out = {"filters": [], "macros": [], "thresholds": {}, "categories_raw": [], "include_cols": [], "intent": "list"}
     if any(k in p for k in ["usa","us","united states"]):
         out["filters"].append({"column":"Country Name","op":"equals","value":"United States"})
     if "india" in p: out["filters"].append({"column":"Country Name","op":"equals","value":"India"})
@@ -401,7 +401,6 @@ def heuristic_query(prompt: str) -> Dict[str, Any]:
     if "rewarded" in p: out["filters"].append({"column":"Is Rewarded Slot","op":"is_true"})
     if "banner" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Banner"})
     if "interstitial" in p or "fsi" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"FSI"})
-    if "native" in p: out["filters"].append({"column":"Final Format","op":"equals","value":"Native"})
     if "video" in p and "rewarded" not in p: out["filters"].append({"column":"Final Format","op":"equals","value":"API Video"})
     if re.search(r"\bnon[-_\s]?gaming\b", p):
         out["filters"].append({"column":"Vertical","op":"equals","value":"Non Gaming"})
@@ -412,6 +411,12 @@ def heuristic_query(prompt: str) -> Dict[str, Any]:
     if "local" in p: out["macros"].append("local_apps")
     for k in ["cars","auto","beauty","finance","fintech","food","travel","education","health","fitness","parenting","sports","news","shopping","entertainment","music","video","business","lifestyle"]:
         if k in p: out["categories_raw"].append(k)
+    if re.search(r"\bhow many\b|\bcount\b|\bnumber of\b", p):
+        out["intent"] = "count"
+    # crude “include” catcher
+    include_hints = re.findall(r"(?:with|including|along with|also show|show)\s+([a-z0-9 _/&-]+)", p)
+    for hint in include_hints:
+        out["include_cols"].append(hint.strip())
     return out
 
 def extract_query_with_errors(prompt: str) -> Dict[str, Any]:
@@ -509,19 +514,27 @@ def apply_macros(df: pd.DataFrame, macros: List[str]) -> pd.DataFrame:
     d = df
     macros = macros or []
     if "premium" in macros:
+        # SDK only
         if "Integration Method" in d.columns:
-            d = d[d["Integration Method"].astype(str).str.contains("sdk", case=False, na=False)]
+            d = d[d["Integration Method"].astype(str).str.contains(r"\bsdk\b", case=False, na=False)]
+        # Exclude MA
         if "Content Rating Id" in d.columns:
-            d = d[~d["Content Rating Id"].astype(str).str.fullmatch(r"MA", case=False)]
+            d = d[~d["Content Rating Id"].astype(str).str.fullmatch(r"\s*MA\s*", case=False)]
+        # Jounce clean variants
         if "Jounce Media" in d.columns:
             def _norm(s: str) -> str:
                 s = str(s or "").lower().strip()
                 s = re.sub(r"\s+", " ", s)
                 s = s.replace(" / ", "/").replace(" /", "/").replace("/ ", "/")
                 return s
-            CLEAN_CANON = {_norm("Clean"), _norm("Clean/no joiner score attached"), _norm("Clean/no jounce score attached")}
+            CLEAN_CANON = {
+                _norm("Clean"),
+                _norm("Clean/no joiner score attached"),
+                _norm("Clean/no jounce score attached"),
+            }
             s = d["Jounce Media"].astype(str).map(_norm)
             d = d[s.isin(CLEAN_CANON)]
+        # Basic app-name sanity (optional)
         if "Inmobi App Name" in d.columns:
             def ok(s):
                 if not isinstance(s,str) or not s: return False
@@ -548,13 +561,44 @@ def aggregate_app_level(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     agg = {}
     for c in NUMERIC_HINTS:
-        if c in df.columns and c != "eCPM":
+        if c in df.columns:
             agg[c] = "sum"
     g = df.groupby(group_cols, dropna=False).agg(agg).reset_index()
+    # Compute eCPM if you ever include it explicitly
     if "Total Burn" in g.columns and "Ad Impressions Rendered" in g.columns:
         denom = g["Ad Impressions Rendered"].replace(0, pd.NA)
         g["eCPM"] = (g["Total Burn"] * 1000.0) / denom
     return g
+
+# ======= INCLUDE-COLS handling =======
+def normalize_include_cols(include_cols: List[str], df: pd.DataFrame) -> List[str]:
+    if not include_cols: return []
+    known = set(df.columns)
+    out = []
+    for raw in include_cols:
+        cand = raw.strip()
+        # exact
+        if cand in known:
+            out.append(cand); continue
+        # alias
+        alias = alias_to_canonical(cand)
+        if alias in known:
+            out.append(alias); continue
+        # fuzzy
+        best = difflib.get_close_matches(cand, list(known), n=1, cutoff=0.7)
+        if best: out.append(best[0])
+    # de-dup, keep order
+    seen = set(); deduped = []
+    for c in out:
+        if c not in seen:
+            seen.add(c); deduped.append(c)
+    return deduped
+
+# ======= INTENT helpers =======
+def is_count_intent(user_text: str, qobj: Dict[str, Any]) -> bool:
+    if (qobj or {}).get("intent") == "count":
+        return True
+    return bool(re.search(r"\bhow many\b|\bcount\b|\bnumber of\b", (user_text or "").lower()))
 
 # =========================
 # UI
@@ -563,12 +607,11 @@ st.title("Avails Bot — App-level List (Smart, Schema-Aware)")
 
 st.sidebar.header("Run options")
 safe_mode = st.sidebar.checkbox("Safe mode (ignore AI & thresholds)", value=False)
-disable_premium_thresholds = st.sidebar.checkbox("Disable premium thresholds", value=False)
 if st.sidebar.button("🔁 Clear cached data"):
     st.cache_data.clear()
     st.experimental_rerun()
 
-user_input = st.text_input("Ask anything (e.g., 'Premium rewarded video gaming apps in United States on SDK, Android')")
+user_input = st.text_input("Ask anything (e.g., 'Premium rewarded video gaming apps in United States on SDK, Android; include Primary Category')")
 
 if user_input:
     region = detect_region(user_input)
@@ -589,11 +632,11 @@ if user_input:
     if safe_mode:
         st.info("Safe mode ON — unfiltered, aggregated app list.")
         g = aggregate_app_level(df.copy())
+        # ensure defaults
         for _col, _default in [
             ("Monthly Traffic", 0),
             ("Ad Impressions Rendered", 0),
             ("Total Burn", 0.0),
-            ("eCPM", 0.0),
         ]:
             if _col not in g.columns: g[_col] = _default
         if g.empty:
@@ -601,8 +644,8 @@ if user_input:
         else:
             sort_cols = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g.columns]
             if sort_cols: g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
-            show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
-            st.dataframe(g[show_cols].head(500), use_container_width=True)
+            base_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
+            st.dataframe(g[base_cols].head(500), use_container_width=True)
             st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
         st.stop()
 
@@ -610,18 +653,40 @@ if user_input:
     parse_info = extract_query_with_errors(user_input)
     q = parse_info.get("parsed") or {}
 
-    # --- HARD ENFORCEMENT: derive the Vertical filter directly from user text ---
+    # --- HARD ENFORCEMENT: derive the Vertical + Macros directly from user text ---
     text_lc = (user_input or "").lower()
+
     def ensure_vertical_filter(qobj, text):
-        # remove any existing Vertical filters first (avoid duplicates / contradictions)
         qobj["filters"] = [f for f in (qobj.get("filters") or []) if f.get("column","").strip().lower() != "vertical"]
         if re.search(r"\bnon[-_\s]?gaming\b", text):
             qobj.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Non Gaming"})
         elif re.search(r"\bgaming\b", text):
             qobj.setdefault("filters", []).append({"column":"Vertical","op":"equals","value":"Gaming"})
         return qobj
+
+    def ensure_macros(qobj, text):
+        macs = set((qobj.get("macros") or []))
+        if re.search(r"\bpremium\b|\bsafe\b", text): macs.add("premium")
+        if re.search(r"\bgreen\b", text): macs.add("green")
+        if re.search(r"\blocal apps?\b", text): macs.add("local_apps")
+        qobj["macros"] = list(macs)
+        return qobj
+
+    def ensure_rewarded(qobj, text):
+        # make rewarded stricter/explicit if the text says so
+        if re.search(r"\brewarded( video)?\b", text):
+            # prefer final_format; also mark slot
+            qobj["final_format"] = "Rewarded Video"
+            existing = qobj.get("filters", [])
+            has_slot = any((f.get("column","").strip().lower()=="is rewarded slot") for f in existing)
+            if not has_slot:
+                existing.append({"column":"Is Rewarded Slot","op":"is_true"})
+            qobj["filters"] = existing
+        return qobj
+
     q = ensure_vertical_filter(q, text_lc)
-    # ---------------------------------------------------------------------------
+    q = ensure_macros(q, text_lc)
+    q = ensure_rewarded(q, text_lc)
 
     with st.expander("Parsed query (debug)"):
         st.json(q)
@@ -655,7 +720,6 @@ if user_input:
         if col.lower() == "vertical": continue
         op = filt.get("op"); val = filt.get("value")
         if alias_to_canonical(col) in {"Country Name"} and isinstance(val, str):
-            # don't transform display; canonicalize only for compare inside apply_one_filter
             pass
         d = apply_one_filter(d, col or "", op or "equals", val)
 
@@ -673,7 +737,7 @@ if user_input:
             patt = "|".join(map(re.escape, mapped_cats))
             d = d[d["Inmobi App Categories"].astype(str).str.contains(patt, case=False, na=False)]
 
-    # macros
+    # macros (now reliably enforced)
     d = apply_macros(d, q.get("macros", []))
 
     # Debug after filters
@@ -684,23 +748,20 @@ if user_input:
     # Aggregate
     g = aggregate_app_level(d)
 
-    # Guarantee default display columns exist
+    # Guarantee defaults (no eCPM default)
     for _col, _default in [
         ("Monthly Traffic", 0),
         ("Ad Impressions Rendered", 0),
         ("Total Burn", 0.0),
-        ("eCPM", 0.0),
     ]:
         if _col not in g.columns: g[_col] = _default
 
-    # thresholds — NO hidden premium floor
+    # thresholds — NONE by default; use sidebar (kept simple)
     st.sidebar.header("Thresholds (post-aggregation)")
-    default_min_vol = q.get("thresholds", {}).get("min_requests", 0) or 0
-
     vol_col = "Monthly Traffic" if "Monthly Traffic" in g.columns else None
-    min_vol = st.sidebar.number_input(f"Min {vol_col or 'Volume'}", 0, 1_000_000_000, int(default_min_vol), 1000) if vol_col else 0
-    min_rend = st.sidebar.number_input("Min Ad Impressions Rendered", 0, 1_000_000_000, int(q.get("thresholds", {}).get("min_rendered", 0) or 0), 1000)
-    min_burn = st.sidebar.number_input("Min Total Burn ($)", 0.0, 1e12, float(q.get("thresholds", {}).get("min_burn", 0.0) or 0.0), 1.0)
+    min_vol = st.sidebar.number_input(f"Min {vol_col or 'Volume'}", 0, 1_000_000_000, 0, 1000) if vol_col else 0
+    min_rend = st.sidebar.number_input("Min Ad Impressions Rendered", 0, 1_000_000_000, 0, 1000)
+    min_burn = st.sidebar.number_input("Min Total Burn ($)", 0.0, 1e12, 0.0, 1.0)
 
     if vol_col and min_vol: g = g[g[vol_col] >= min_vol]
     if "Ad Impressions Rendered" in g.columns and min_rend: g = g[g["Ad Impressions Rendered"] >= min_rend]
@@ -711,48 +772,52 @@ if user_input:
     if sort_cols:
         g = g.sort_values(sort_cols, ascending=[False]*len(sort_cols))
 
+    # ===== Intent: COUNT (unique bundles/apps) =====
+    if is_count_intent(user_input, q):
+        # Unique Forwarded Bundle ID after filters/aggregation scope
+        uniq_bundles = g["Forwarded Bundle ID"].nunique() if "Forwarded Bundle ID" in g.columns else 0
+        uniq_apps = g["Inmobi App Inc ID"].nunique() if "Inmobi App Inc ID" in g.columns else uniq_bundles
+        st.success(f"Unique apps (by bundle): **{uniq_bundles}**  |  Unique apps (by Inmobi App Inc ID): **{uniq_apps}**")
+        # Still show a small preview for context
+        preview_cols = [c for c in ["Inmobi App Name","Forwarded Bundle ID","Operating System Name","Monthly Traffic"] if c in g.columns]
+        if preview_cols:
+            st.dataframe(g[preview_cols].head(50), use_container_width=True)
+        st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
+        st.stop()
+
+    # ===== Include extra columns on demand =====
+    include_cols = normalize_include_cols(q.get("include_cols", []), g)
+    # Allow users to explicitly ask for eCPM
+    if any(re.search(r"\becpm\b", str(x), re.I) for x in q.get("include_cols", [])):
+        if "eCPM" not in include_cols and "eCPM" in g.columns:
+            include_cols.append("eCPM")
+
     # Graceful fallbacks if empty
     if g.empty:
-        # 1) Drop thresholds only
-        d_no_thresh = d.copy()
-        g_no_thresh = aggregate_app_level(d_no_thresh)
-        for _col, _default in [("Monthly Traffic",0),("Ad Impressions Rendered",0),("Total Burn",0.0),("eCPM",0.0)]:
-            if _col not in g_no_thresh.columns: g_no_thresh[_col] = _default
-        if not g_no_thresh.empty:
-            st.info("No rows met your thresholds. Showing results with the same filters but **without thresholds**.")
-            sort_cols2 = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g_no_thresh.columns]
-            if sort_cols2: g_no_thresh = g_no_thresh.sort_values(sort_cols2, ascending=[False]*len(sort_cols2))
-            show_cols2 = [c for c in DISPLAY_COLS_ORDER if c in g_no_thresh.columns]
-            st.dataframe(g_no_thresh[show_cols2].head(500), use_container_width=True)
-            st.download_button("Download CSV (no thresholds)", g_no_thresh.to_csv(index=False).encode("utf-8"), "avails_no_thresholds.csv", "text/csv")
-            st.stop()
-
-        # 2) If strict Rewarded was requested, relax to rewarded slot
+        # 1) Try relaxing strict rewarded to rewarded slot
         if ff == "Rewarded Video" and "Final Format" in df.columns:
             d_relaxed = df.copy()
             d_relaxed = normalize_vertical_column(d_relaxed)
-            # Re-apply Vertical
             for filt in q.get("filters", []):
                 if (filt.get("column") or "").strip().lower() == "vertical":
                     d_relaxed = apply_one_filter(d_relaxed, "Vertical", filt.get("op","equals"), filt.get("value"))
-            # Re-apply other filters except Final Format
             for filt in q.get("filters", []):
                 col = (filt.get("column") or "").strip().lower()
                 if col in {"vertical","final format"}: 
                     continue
                 d_relaxed = apply_one_filter(d_relaxed, filt.get("column") or "", filt.get("op") or "equals", filt.get("value"))
-            # Keep rewarded by slot flag
             if "Is Rewarded Slot" in d_relaxed.columns:
                 d_relaxed = d_relaxed[d_relaxed["Is Rewarded Slot"].astype(str).str.contains("true|1|yes", case=False, na=False)]
             d_relaxed = apply_macros(d_relaxed, q.get("macros", []))
             g_relaxed = aggregate_app_level(d_relaxed)
-            for _col, _default in [("Monthly Traffic",0),("Ad Impressions Rendered",0),("Total Burn",0.0),("eCPM",0.0)]:
+            for _col, _default in [("Monthly Traffic",0),("Ad Impressions Rendered",0),("Total Burn",0.0)]:
                 if _col not in g_relaxed.columns: g_relaxed[_col] = _default
             if not g_relaxed.empty:
                 st.info("No rows with strict 'Rewarded Video'. Showing **rewarded slots** (relaxed) with your other filters.")
                 sort_cols3 = [c for c in ["Monthly Traffic","Total Burn","Ad Impressions Rendered"] if c in g_relaxed.columns]
                 if sort_cols3: g_relaxed = g_relaxed.sort_values(sort_cols3, ascending=[False]*len(sort_cols3))
-                show_cols3 = [c for c in DISPLAY_COLS_ORDER if c in g_relaxed.columns]
+                base_cols3 = [c for c in DISPLAY_COLS_ORDER if c in g_relaxed.columns]
+                show_cols3 = base_cols3 + [c for c in include_cols if c not in base_cols3 and c in g_relaxed.columns]
                 st.dataframe(g_relaxed[show_cols3].head(500), use_container_width=True)
                 st.download_button("Download CSV (rewarded relaxed)", g_relaxed.to_csv(index=False).encode("utf-8"), "avails_rewarded_relaxed.csv", "text/csv")
                 st.stop()
@@ -760,13 +825,13 @@ if user_input:
         st.warning("No results. Try lowering thresholds or removing 'rewarded'/'premium'.")
         st.stop()
 
-    if g.empty:
-        st.warning("No results. Loosen filters or thresholds.")
-    else:
-        show_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
-        st.success(f"Apps matched: {len(g)}")
-        st.dataframe(g[show_cols].head(500), use_container_width=True)
-        st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
+    # Success table
+    base_cols = [c for c in DISPLAY_COLS_ORDER if c in g.columns]
+    show_cols = base_cols + [c for c in include_cols if c not in base_cols and c in g.columns]
+
+    st.success(f"Apps matched: {len(g)}")
+    st.dataframe(g[show_cols].head(500), use_container_width=True)
+    st.download_button("Download CSV", g.to_csv(index=False).encode("utf-8"), "avails_app_level.csv", "text/csv")
 
     with st.expander("Available columns in dataset"):
         st.write(sorted(df.columns.tolist()))
